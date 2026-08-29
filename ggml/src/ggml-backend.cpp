@@ -22,6 +22,8 @@
 #include <algorithm>
 #include <vector>
 #include <queue>
+#include <map>
+#include <string>
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -1862,7 +1864,61 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 fprintf(stderr, " %s", ggml_op_name(t->op));
             }
             fprintf(stderr, "\n"); fflush(stderr);
+            static unsigned long long prof_tot_cpu_us = 0, prof_tot_htp_us = 0, prof_n_cpu = 0, prof_n_htp = 0;
+            static unsigned long long cpu_op_us[512] = {0}, cpu_op_n[512] = {0};
+            static std::map<std::string, unsigned long long> cpu_name_us;
+            static std::map<std::string, unsigned long long> cpu_name_n;
+            static bool prof_first = true;
+            if (prof_first) {
+                prof_first = false;
+                fprintf(stderr, "[prof] PERFSPLIT split_id backend n_nodes wall_us\n");
+            }
+            int64_t p0 = ggml_time_us();
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            ggml_backend_synchronize(split_backend);
+            int64_t p1 = ggml_time_us();
+            if (split_backend_id == sched->n_backends - 1) { // CPU is last
+                prof_tot_cpu_us += (p1 - p0); prof_n_cpu++;
+                // attribute CPU wall time to opcodes proportional to node count
+                int nop = split->graph.n_nodes ? split->graph.n_nodes : 1;
+                unsigned long long per = (p1 - p0) / nop;
+                for (int ni = 0; ni < split->graph.n_nodes; ni++) {
+                    int o = (int)split->graph.nodes[ni]->op;
+                    if (o >= 0 && o < 512) { cpu_op_us[o] += per; cpu_op_n[o]++; }
+                    // name-level Pareto for compute ops (MUL_MAT=29, MUL_MAT_ID=58, GET_ROWS=100)
+                    if (o == 29 || o == 58 || o == 100) {
+                        const char * nm = split->graph.nodes[ni]->name;
+                        if (nm && nm[0]) {
+                            // aggregate by base name (strip nothing; names like blk.0.ffn_gate.weight)
+                            auto it = cpu_name_us.find(nm);
+                            if (it == cpu_name_us.end()) { cpu_name_us[nm] = per; cpu_name_n[nm] = 1; }
+                            else { it->second += per; cpu_name_n[nm]++; }
+                        }
+                    }
+                }
+            } else {
+                prof_tot_htp_us += (p1 - p0); prof_n_htp++;
+            }
+            // write CPU Pareto periodically
+            static int prof_write_n = 0;
+            prof_write_n++;
+            if (prof_write_n % 200 == 0) {
+                FILE * f = fopen("/data/local/tmp/npu/cpu_op_prof.txt", "w");
+                if (f) {
+                    for (int o = 0; o < 512; o++) if (cpu_op_n[o]) {
+                        fprintf(f, "[prof] CPU_OP %d %llu %llu %llu\n", o, cpu_op_n[o], cpu_op_us[o], cpu_op_n[o] ? cpu_op_us[o]/cpu_op_n[o] : 0);
+                    }
+                    fprintf(f, "[prof] CPU_TOTAL %llu\n", prof_tot_cpu_us);
+                    fprintf(f, "[prof] HTP_TOTAL %llu\n", prof_tot_htp_us);
+                    fprintf(f, "== NAME-LEVEL PARETO ==\n");
+                    for (auto & kv : cpu_name_us) {
+                        const char * base = strrchr(kv.first.c_str(), '.');
+                        const char * label = base ? base + 1 : kv.first.c_str();
+                        fprintf(f, "[prof] CPU_NAME %s %llu %llu %llu\n", label, cpu_name_n[kv.first], kv.second, cpu_name_n[kv.first] ? kv.second / cpu_name_n[kv.first] : 0);
+                    }
+                    fclose(f);
+                }
+            }
             fprintf(stderr, "[compute] split %d DONE ec=%d\n", split_id, ec); fflush(stderr);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;

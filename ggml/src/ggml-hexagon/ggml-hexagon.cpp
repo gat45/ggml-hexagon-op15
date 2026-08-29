@@ -1683,6 +1683,15 @@ void ggml_hexagon_session::flush_pending(bool all) {
 
         if (!all) break;
     }
+    // RPC summary: total dspcall time (kernel+response) vs pure wait (empty-queue retries)
+    FILE * rf = fopen("/data/local/tmp/npu/rpc_prof.txt", "w");
+    if (rf) {
+        fprintf(rf, "[prof] RPC n_dspcall=%llu dspcall_total_us=%llu dspcall_avg_us=%llu n_wait=%llu wait_total_us=%lld\n",
+                (unsigned long long) this->n_dspcall, (unsigned long long) this->cum_dspcall_us,
+                this->n_dspcall ? (unsigned long long)(this->cum_dspcall_us / this->n_dspcall) : 0,
+                (unsigned long long) this->n_wait, (long long) this->cum_wait_us);
+        fclose(rf);
+    }
 }
 
 void ggml_hexagon_session::flush_batch() {
@@ -3810,15 +3819,32 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
 
     // Queue and execute
     if (opt_opstage & HTP_OPSTAGE_QUEUE) {
-        fprintf(stderr, "[hex_graph_compute] n_nodes=%d n_htp_ops=%zu\n", graph->n_nodes, nodes_ptr->size());
+        int64_t q0 = ggml_time_us();
         for (const auto & node : *nodes_ptr) {
-            fprintf(stderr, "[hex_op] opcode=%d dst=%s\n", (int)node.opcode, node.node->name);
             sess->enqueue_op(node);
         }
+        int64_t q1 = ggml_time_us();
+        sess->flush();
+        int64_t q2 = ggml_time_us();
+        // OP-level HTP aggregate: time includes queue+flush (kernel+response).
+        static unsigned long long ag_us[64] = {0}, ag_n[64] = {0};
+        for (const auto & node : *nodes_ptr) {
+            int o = (int)node.opcode;
+            if (o >= 0 && o < 64) { ag_us[o] += (q2 - q1); ag_n[o] += 1; }
+        }
+        static bool prof_hdr = false;
+        if (!prof_hdr) { prof_hdr = true; fprintf(stderr, "[prof] HTP_OP opcode n total_us avg_us\n"); }
+        if (prof_hdr) {
+            FILE * f = fopen("/data/local/tmp/npu/htp_op_prof.txt", "w");
+            if (f) {
+                for (int o = 0; o < 64; o++) if (ag_n[o]) {
+                    fprintf(f, "[prof] HTP_OP %d %llu %llu %llu\n", o, ag_n[o], ag_us[o], ag_n[o] ? ag_us[o]/ag_n[o] : 0);
+                }
+                fclose(f);
+            }
+        }
+        (void)q0; (void)q2;
     }
-
-    // Wait until all pending ops complete
-    sess->flush();
 
     return GGML_STATUS_SUCCESS;
 }

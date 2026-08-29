@@ -6324,6 +6324,15 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(beta->ne[0] == 1);
 
     // state holds the initial state s0 only: [S_v, S_v, H, n_seqs]. K (snapshot slot count) is an op param.
+    if (!(state->ne[0] == S_v && state->ne[1] == S_v && state->ne[2] == H && state->ne[3] == n_seqs)) {
+        fprintf(stderr, "[GDN-DIAG] state ne=[%ld,%ld,%ld,%ld] vs S_v=%ld H=%ld n_tokens=%ld n_seqs=%ld | v ne=[%ld,%ld,%ld,%ld] k ne=[%ld,%ld,%ld,%ld] q ne=[%ld,%ld,%ld,%ld]\n",
+                (long)state->ne[0], (long)state->ne[1], (long)state->ne[2], (long)state->ne[3],
+                (long)S_v, (long)H, (long)n_tokens, (long)n_seqs,
+                (long)v->ne[0], (long)v->ne[1], (long)v->ne[2], (long)v->ne[3],
+                (long)k->ne[0], (long)k->ne[1], (long)k->ne[2], (long)k->ne[3],
+                (long)q->ne[0], (long)q->ne[1], (long)q->ne[2], (long)q->ne[3]);
+        fflush(stderr);
+    }
     GGML_ASSERT(state->ne[0] == S_v);
     GGML_ASSERT(state->ne[1] == S_v);
     GGML_ASSERT(state->ne[2] == H);
