@@ -24,6 +24,23 @@ include(ExternalProject)
 
 option(GGML_HEXAGON_USE_MEMPOOL "ggml-hexagon: mempool/FastRPC-invoke AP implementation (single mempool, synchronous invoke); OFF = dspqueue/per-buffer implementation" OFF)
 option(GGML_HEXAGON_HTP_DEBUG   "ggml-hexagon: enable HTP debug output" OFF)
+option(GGML_HEXAGON_SKIP_SKELS  "ggml-hexagon: skip DSP skel build (prebuilt libggml-htp-*.so deployed to device separately)" OFF)
+
+# Prefer checked-in pre-generated qaic stubs (htp/gen) when present so the
+# AP-side build does not require running the Linux-only qaic tool.
+if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/htp/gen/ggml_htp_stub.c)
+    message(STATUS "hexagon: using pre-generated IDL stubs from htp/gen")
+    set(GGML_HTP_STUB_SRC     ${CMAKE_CURRENT_SOURCE_DIR}/htp/gen/ggml_htp_stub.c)
+    set(GGML_HTP_GEN_INCDIR   ${CMAKE_CURRENT_SOURCE_DIR}/htp/gen)
+else()
+    set(GGML_HTP_STUB_SRC     ${CMAKE_CURRENT_BINARY_DIR}/ggml_htp_stub.c)
+    set(GGML_HTP_GEN_INCDIR   ${CMAKE_CURRENT_BINARY_DIR})
+endif()
+if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/htp/gen/htp_iface_stub.c)
+    set(GGML_HTI_STUB_SRC     ${CMAKE_CURRENT_SOURCE_DIR}/htp/gen/htp_iface_stub.c)
+else()
+    set(GGML_HTI_STUB_SRC     ${CMAKE_CURRENT_BINARY_DIR}/htp_iface_stub.c)
+endif()
 
 set(TARGET_NAME ggml-hexagon)
 
@@ -31,7 +48,7 @@ set(GGML_HEXAGON_HTP_CERT  "$ENV{HEXAGON_HTP_CERT}" CACHE PATH "ggml-hexagon: en
 
 if (GGML_HEXAGON_USE_MEMPOOL)
     add_library(ggml_htp OBJECT
-        ${CMAKE_CURRENT_BINARY_DIR}/ggml_htp_stub.c)
+        ${GGML_HTP_STUB_SRC})
 
     set_target_properties(ggml_htp PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -40,9 +57,12 @@ if (GGML_HEXAGON_USE_MEMPOOL)
         ${HEXAGON_SDK_ROOT}/incs/stddef
         ${HEXAGON_SDK_ROOT}/utils/examples
         ${CMAKE_CURRENT_SOURCE_DIR}/htp
+        ${GGML_HTP_GEN_INCDIR}
         ${CMAKE_CURRENT_BINARY_DIR})
 
-    build_idl(htp/ggml_htp.idl ggml_htp)
+    if (NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/htp/gen/ggml_htp_stub.c)
+        build_idl(htp/ggml_htp.idl ggml_htp)
+    endif()
 
     if (CMAKE_SYSTEM_NAME MATCHES Android)
         target_link_options(ggml_htp PUBLIC -llog -ldl)
@@ -63,13 +83,15 @@ if (GGML_HEXAGON_USE_MEMPOOL)
         ${HEXAGON_SDK_ROOT}/incs
         ${HEXAGON_SDK_ROOT}/incs/stddef
         ${CMAKE_CURRENT_SOURCE_DIR}/htp
+        ${GGML_HTP_GEN_INCDIR}
         ${CMAKE_CURRENT_BINARY_DIR})
 
     target_link_libraries(${TARGET_NAME} PRIVATE ggml_htp)
-    target_include_directories(${TARGET_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/htp ${CMAKE_CURRENT_BINARY_DIR})
+    target_include_directories(${TARGET_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/htp ${GGML_HTP_GEN_INCDIR} ${CMAKE_CURRENT_BINARY_DIR})
 
     # Build HTP skels
     set(HTP_SKELS)
+    if (NOT GGML_HEXAGON_SKIP_SKELS)
     function(build_htp_skel_mempool V)
         ExternalProject_Add(htp-mempool-${V}
             SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/htp BUILD_ALWAYS ON
@@ -92,6 +114,7 @@ if (GGML_HEXAGON_USE_MEMPOOL)
     build_htp_skel_mempool(v75)
     build_htp_skel_mempool(v79)
     build_htp_skel_mempool(v81)
+    endif() # NOT GGML_HEXAGON_SKIP_SKELS
 
     if (EXISTS ${CMAKE_SOURCE_DIR}/scripts/ggml-hexagon.cfg)
         add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
@@ -101,7 +124,7 @@ if (GGML_HEXAGON_USE_MEMPOOL)
     endif()
 else()
     add_library(htp_iface OBJECT
-        ${CMAKE_CURRENT_BINARY_DIR}/htp_iface_stub.c)
+        ${GGML_HTI_STUB_SRC})
 
     set_target_properties(htp_iface PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_include_directories(htp_iface PUBLIC
@@ -109,9 +132,12 @@ else()
         ${HEXAGON_SDK_ROOT}/incs/stddef
         ${HEXAGON_SDK_ROOT}/utils/examples
         ${CMAKE_CURRENT_SOURCE_DIR}/htp
+        ${GGML_HTP_GEN_INCDIR}
         ${CMAKE_CURRENT_BINARY_DIR})
 
-    build_idl(htp/htp_iface.idl htp_iface)
+    if (NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/htp/gen/htp_iface_stub.c)
+        build_idl(htp/htp_iface.idl htp_iface)
+    endif()
 
     if (CMAKE_SYSTEM_NAME MATCHES Android)
         target_link_options(htp_iface PUBLIC -llog -ldl)
@@ -158,7 +184,9 @@ else()
 endif()
 
 # Install Hexagon skels required at runtime
-install(FILES ${HTP_SKELS} TYPE LIB)
+if (HTP_SKELS)
+    install(FILES ${HTP_SKELS} TYPE LIB)
+endif()
 
 if (CMAKE_SYSTEM_NAME MATCHES Windows AND GGML_HEXAGON_HTP_CERT)
     file(TO_CMAKE_PATH "$ENV{WINDOWS_SDK_BIN}/arm64"      WINSDK_BIN0_ARM64)

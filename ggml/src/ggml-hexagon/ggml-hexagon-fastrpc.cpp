@@ -230,6 +230,10 @@ struct ggml_backend_hexagon_context {
     int64_t  cum_p10_us;                        // Phase 10: mempool->heap copy-back
     int64_t  cum_unaccounted_us;                // wall-clock not covered by p1..p10 (gaps, scheduler, etc.)
 
+    int64_t  cum_mirror_bytes;                  // Phase 5: total bytes mirrored into mempool
+    int64_t  cum_mirror_copies;                 // Phase 5: number of mirror operations
+    int64_t  cum_repack_bytes;                  // Phase 6: total bytes tiled into repack buffer
+
     // FastRPC transport overhead calibration (measured via 0xFFFB warmup invokes at init)
     // The 0xFFFB warmup mode does no NPU work, so measured time is an upper bound of
     // pure FastRPC transport overhead (invoke round-trip: AP -> NPU -> AP)
@@ -630,6 +634,11 @@ static void ggmlhexagon_dump_perf_stats(const ggml_backend_hexagon_context * ctx
                              (unsigned long long)ctx->cgraph_cache_hits,
                              (unsigned long long)ctx->cgraph_cache_misses,
                              total_cache_lookups ? (100.0 * ctx->cgraph_cache_hits / total_cache_lookups) : 0.0);
+    GGMLHEXAGON_LOG_VERBOSE("mirror: bytes=%llu copies=%llu",
+                             (unsigned long long)ctx->cum_mirror_bytes,
+                             (unsigned long long)ctx->cum_mirror_copies);
+    GGMLHEXAGON_LOG_VERBOSE("repack: bytes=%llu",
+                             (unsigned long long)ctx->cum_repack_bytes);
 
     // MUL_MAT optimization diagnostics (PP). Cumulative across the run.
     // - n_mul_mat_total: every MUL_MAT in supported_nodes (cache miss only)
@@ -1577,16 +1586,21 @@ static int ggmlhexagon_probe_dspinfo(ggml_backend_hexagon_context * ctx) {
         || dsp_version == 0x75 || dsp_version == 0x79 || dsp_version == 0x81) {
         //0x68 -> 68, 0x69 -> 69, 0x73 -> 73, 0x75 -> 75, 0x79 -> 79, 0x81 -> 81
         htp_arch = ggmlhexagon_htparch_hex_to_decimal(dsp_version);
-        struct qcom_socinfo * socinfo = ggmlhexagon_get_socinfo_from_htparch(htp_arch);
-        GGML_ASSERT(nullptr != socinfo);
-        ctx->socinfo = *socinfo;
-        size_t total_mem = ggmlhexagon_get_system_total_memory_in_bytes();
-        GGMLHEXAGON_LOG_ALWAYS("device info: %s, %s, dsp arch version 0x%x, system mem size %zu MiB",
-                                socinfo->soc_desc, ggmlhexagon_get_htparch_desc(htp_arch), dsp_version, total_mem / SIZE_IN_MB);
     } else {
-        GGMLHEXAGON_LOG_ERROR("device info: unknown");
-        GGML_ASSERT(1 == 0);
+        // DSPRPC_GET_DSP_INFO (ARCH_VER) peut échouer ou renvoyer 0 quand l'unsigned
+        // PD n'est pas autorisé sur le CDSP (signed offload). On retombe sur V81
+        // (Snapdragon 8 Elite / SM8850) au lieu d'abandonner.
+        GGMLHEXAGON_LOG_ERROR("device info: unknown (raw 0x%x) - forcing V81 (SM8850)",
+                              dsp_version);
+        dsp_version = 0x81;
+        htp_arch = ggmlhexagon_htparch_hex_to_decimal(dsp_version);
     }
+    struct qcom_socinfo * socinfo = ggmlhexagon_get_socinfo_from_htparch(htp_arch);
+    GGML_ASSERT(nullptr != socinfo);
+    ctx->socinfo = *socinfo;
+    size_t total_mem = ggmlhexagon_get_system_total_memory_in_bytes();
+    GGMLHEXAGON_LOG_ALWAYS("device info: %s, %s, dsp arch version 0x%x, system mem size %zu MiB",
+                            socinfo->soc_desc, ggmlhexagon_get_htparch_desc(htp_arch), dsp_version, total_mem / SIZE_IN_MB);
 
     uint32_t vtcm_count = 0;
     uint32_t vtcm_page  = 0;
@@ -3643,6 +3657,9 @@ ggml_backend_hexagon_context::ggml_backend_hexagon_context(int dev_id, ggml_back
       cum_p9_dsp_exec_us(0),
       cum_p10_us(0),
       cum_unaccounted_us(0),
+      cum_mirror_bytes(0),
+      cum_mirror_copies(0),
+      cum_repack_bytes(0),
       rpc_overhead_min_us(0),
       rpc_overhead_max_us(0),
       rpc_overhead_sum_us(0),
@@ -4457,6 +4474,9 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
         const char * dp                     = (const char *)tensor->data;
         const char * base                   = (const char *)hctx->rpc_mempool;
         const char * end                    = base + (ptrdiff_t)hctx->rpc_mempool_len;
+        if (dp >= base && dp < end) {
+            hctx->cum_repack_bytes += (int64_t)size;
+        }
         GGML_ASSERT(offset == 0);
         GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
 
@@ -5647,6 +5667,8 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         temp_region_indices.push_back(ctx->ion_regions.size() - 1);
 
         memcpy(ion_buf, data_ptr, mirror_size);
+        ctx->cum_mirror_bytes += (int64_t)mirror_size;
+        ctx->cum_mirror_copies++;
 
         info.mirror_offset = moff;
         info.allocated = true;

@@ -283,6 +283,14 @@ struct ggml_hexagon_session {
     size_t   max_vmem  = 0;
     size_t   max_bufsize = 0;
 
+    // -- jz profile aggregates --
+    uint64_t cum_dspcall_us  = 0;
+    uint64_t n_dspcall       = 0;
+    uint64_t dspcall_min_us  = 0;
+    uint64_t dspcall_max_us  = 0;
+    int64_t  cum_wait_us     = 0;
+    uint64_t n_wait          = 0;
+
     struct {
         uint64_t uid = 0;
         std::vector<htp_opnode> htp_nodes;
@@ -1574,8 +1582,15 @@ void ggml_hexagon_session::flush_pending(bool all) {
         // Read response packet from queue
         const uint32_t timeo = opt_oppoll ? 0 : DSPQUEUE_TIMEOUT;
 
+        memset(&rsp, 0, sizeof(rsp));
+        int64_t t0 = ggml_time_us();
         int err = dspqueue_read(this->queue, &flags, 1, &n_dbufs, &dbuf, sizeof(rsp), &rsp_size, (uint8_t *) &rsp, timeo);
-        if (err == AEE_EEXPIRED || err == AEE_EWOULDBLOCK) {
+        int64_t t1 = ggml_time_us();
+        if (err == AEE_EEXPIRED || err == AEE_EWOULDBLOCK || err == AEE_EINTERRUPTED) {
+            // EEXPIRED/EWOULDBLOCK = empty queue (retry), EINTERRUPTED (46) =
+            // blocking read was woken prematurely by a system signal; retry too.
+            this->cum_wait_us += (t1 - t0);
+            this->n_wait++;
             continue;
         }
 
@@ -1583,9 +1598,56 @@ void ggml_hexagon_session::flush_pending(bool all) {
             GGML_ABORT("ggml-hex: dspqueue_read failed: 0x%08x\n", (unsigned) err);
         }
 
+        // Compat: the deployed June-2 skel returns the LEGACY htp_opbatch_rsp
+        // (24 bytes = id,status,n_bufs,n_tensors,n_ops,pad). The modern struct's
+        // first six fields are identical (id..n_ops then pad at offset 20), so a
+        // 24-byte response is a valid prefix; n_traces/usecs/cycles stay zero.
+        bool legacy24 = (rsp_size == 24);
+        if (legacy24) {
+            rsp_size = sizeof(rsp);
+        }
+
         // Basic sanity checks
         if (rsp_size != sizeof(rsp) || n_dbufs != 1) {
+            FILE * f = fopen("/data/local/tmp/npu/dspcall_dump.txt", "a");
+            if (f) {
+                fprintf(f, "BAD RESP rsp_size=%u sizeof(rsp)=%zu n_dbufs=%u\n", rsp_size, sizeof(rsp), n_dbufs);
+                const uint8_t * raw = (const uint8_t *) &rsp;
+                fprintf(f, "raw[32]: ");
+                for (int k = 0; k < 32 && k < (int)rsp_size; k++) fprintf(f, "%02x ", raw[k]);
+                fprintf(f, "\n");
+                fprintf(f, "fields: id=%u status=%u n_bufs=%u n_tensors=%u n_ops=%u usecs=%u\n",
+                        rsp.id, rsp.status, rsp.n_bufs, rsp.n_tensors, rsp.n_ops, rsp.usecs);
+                fprintf(f, "dbuf: size=%u ptr=%p\n", dbuf.size, dbuf.ptr);
+                fclose(f);
+            }
             GGML_ABORT("ggml-hex: %s dspcall : bad response : size %u dspbufs %u\n", this->c_name(), rsp_size, n_dbufs);
+        }
+
+        HEX_VERBOSE("ggml-hex: %s dspcall wall=%lld us rsp_size=%u n_dbufs=%u legacy24=%d\n",
+                this->c_name(), (long long) (t1 - t0), rsp_size, n_dbufs, (int) legacy24);
+
+        this->cum_dspcall_us += (t1 - t0);
+        this->n_dspcall++;
+        if (this->n_dspcall == 1) this->dspcall_min_us = this->dspcall_max_us = (t1 - t0);
+        else {
+            if ((t1 - t0) < (int64_t) this->dspcall_min_us) this->dspcall_min_us = (t1 - t0);
+            if ((t1 - t0) > (int64_t) this->dspcall_max_us) this->dspcall_max_us = (t1 - t0);
+        }
+        if ((this->n_dspcall % 512) == 0) {
+            FILE * f = fopen("/data/local/tmp/npu/jz_prof.txt", "a");
+            if (f) {
+                fprintf(f, "jzprof %s n_dspcall=%llu cum_us=%llu mean_us=%llu min_us=%llu max_us=%llu n_wait=%llu cum_wait_us=%lld\n",
+                        this->c_name(),
+                        (unsigned long long) this->n_dspcall,
+                        (unsigned long long) this->cum_dspcall_us,
+                        (unsigned long long) (this->cum_dspcall_us / this->n_dspcall),
+                        (unsigned long long) this->dspcall_min_us,
+                        (unsigned long long) this->dspcall_max_us,
+                        (unsigned long long) this->n_wait,
+                        (long long) this->cum_wait_us);
+                fclose(f);
+            }
         }
 
         if (rsp.status != HTP_STATUS_OK) {
@@ -1923,6 +1985,21 @@ ggml_hexagon_session::ggml_hexagon_session(int dev_id, ggml_backend_dev_t dev) n
 }
 
 ggml_hexagon_session::~ggml_hexagon_session() noexcept(true) {
+    if (this->n_dspcall > 0) {
+        FILE * f = fopen("/data/local/tmp/npu/jz_prof.txt", "a");
+        if (f) {
+            fprintf(f, "jzprof %s: n_dspcall=%llu cum_dspcall_us=%llu mean_us=%llu min_us=%llu max_us=%llu n_wait=%llu cum_wait_us=%lld\n",
+                    this->c_name(),
+                    (unsigned long long) this->n_dspcall,
+                    (unsigned long long) this->cum_dspcall_us,
+                    (unsigned long long) (this->cum_dspcall_us / this->n_dspcall),
+                    (unsigned long long) this->dspcall_min_us,
+                    (unsigned long long) this->dspcall_max_us,
+                    (unsigned long long) this->n_wait,
+                    (long long) this->cum_wait_us);
+            fclose(f);
+        }
+    }
     release();
 
     delete static_cast<ggml_backend_hexagon_buffer_type_context *>(buffer_type.context);

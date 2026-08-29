@@ -21,6 +21,7 @@
 #include <string.h>
 #include <algorithm>
 #include <vector>
+#include <queue>
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -1283,6 +1284,111 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
         }
         GGML_ASSERT(*cur_backend_id != -1);
+    }
+
+    // pass 4.5: reorder nodes to group by backend (HTP first, CPU last)
+    // This eliminates backend_switch splits by making all HTP ops consecutive
+    {
+        const int n = graph->n_nodes;
+        fprintf(stderr, "[pass4.5] START n=%d n_backends=%d\n", n, sched->n_backends);
+        if (n > 1) {
+            // build in-degree and dependency tracking
+            std::vector<int> in_degree(n, 0);
+            std::vector<std::vector<int>> deps(n); // deps[i] = list of nodes that node i depends on
+            fprintf(stderr, "[pass4.5] building deps...\n");
+            for (int i = 0; i < n; i++) {
+                if (i % 1000 == 0) fprintf(stderr, "[pass4.5] deps i=%d/%d\n", i, n);
+                struct ggml_tensor * node = graph->nodes[i];
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    struct ggml_tensor * src = node->src[j];
+                    if (src == NULL) continue;
+                    // find src in nodes array
+                    for (int k = 0; k < n; k++) {
+                        if (graph->nodes[k] == src) {
+                            deps[i].push_back(k);
+                            in_degree[i]++;
+                            break;
+                        }
+                    }
+                }
+            }
+            fprintf(stderr, "[pass4.5] deps DONE\n");
+
+            // topological sort with backend affinity:
+            // prefer nodes on non-CPU backends (HTP), then by in-degree
+            std::vector<int> result;
+            result.reserve(n);
+            std::vector<bool> visited(n, false);
+
+            // find all nodes with in_degree == 0
+            // use a priority: HTP backend first, then lower in-degree
+            auto cmp = [&](int a, int b) {
+                int ba = tensor_backend_id(graph->nodes[a]);
+                int bb = tensor_backend_id(graph->nodes[b]);
+                // non-CPU backends first (lower backend_id = higher priority)
+                // CPU is typically the last backend (n_backends - 1)
+                bool a_is_gpu = (ba < sched->n_backends - 1);
+                bool b_is_gpu = (bb < sched->n_backends - 1);
+                if (a_is_gpu != b_is_gpu) return b_is_gpu; // GPU first
+                // same type: prefer lower in-degree (fewer dependencies)
+                return in_degree[a] > in_degree[b]; // reverse for max-heap
+            };
+
+            std::priority_queue<int, std::vector<int>, decltype(cmp)> pq(cmp);
+            int zero_count = 0;
+            for (int i = 0; i < n; i++) {
+                if (in_degree[i] == 0) {
+                    pq.push(i);
+                    zero_count++;
+                }
+            }
+            fprintf(stderr, "[pass4.5] sort: zero_in_degree=%d pq_size=%d\n", zero_count, (int)pq.size());
+
+            int sort_count = 0;
+            while (!pq.empty()) {
+                int idx = pq.top();
+                pq.pop();
+                if (visited[idx]) continue;
+                visited[idx] = true;
+                result.push_back(idx);
+                sort_count++;
+                if (sort_count % 1000 == 0) fprintf(stderr, "[pass4.5] sort processed=%d/%d pq_size=%d\n", sort_count, n, (int)pq.size());
+
+                // decrement in_degree for all nodes that depend on this one
+                for (int i = 0; i < n; i++) {
+                    if (visited[i]) continue;
+                    for (int k : deps[i]) {
+                        if (k == idx) {
+                            in_degree[i]--;
+                            if (in_degree[i] == 0) {
+                                pq.push(i);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            fprintf(stderr, "[pass4.5] sort DONE processed=%d result_size=%d\n", sort_count, (int)result.size());
+
+            // handle any remaining nodes (cycles or view ops)
+            int remaining = 0;
+            for (int i = 0; i < n; i++) {
+                if (!visited[i]) {
+                    result.push_back(i);
+                    remaining++;
+                }
+            }
+            fprintf(stderr, "[pass4.5] remaining=%d total_result=%d\n", remaining, (int)result.size());
+
+            // apply reordering
+            struct ggml_tensor ** new_nodes = (struct ggml_tensor **)malloc(n * sizeof(struct ggml_tensor *));
+            for (int i = 0; i < n; i++) {
+                new_nodes[i] = graph->nodes[result[i]];
+            }
+            memcpy(graph->nodes, new_nodes, n * sizeof(struct ggml_tensor *));
+            free(new_nodes);
+            fprintf(stderr, "[pass4.5] APPLIED\n");
+        }
     }
 
     // pass 5: split graph, find tensors that need to be copied
