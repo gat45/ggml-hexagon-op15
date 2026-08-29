@@ -1591,6 +1591,14 @@ void ggml_hexagon_session::flush_pending(bool all) {
             // blocking read was woken prematurely by a system signal; retry too.
             this->cum_wait_us += (t1 - t0);
             this->n_wait++;
+            // SPIN detector: if we retry many times without a response, the DSP
+            // is not replying (firmware hang on this op batch). Print once per
+            // second so the hang point is visible.
+            if (this->n_wait % 1000 == 0) {
+                fprintf(stderr, "[dspcall] SPIN waiting rsp: n_wait=%llu op_pending=%d last_err=%d\n",
+                        (unsigned long long) this->n_wait, (int) this->op_pending, err);
+                fflush(stderr);
+            }
             continue;
         }
 
@@ -1626,6 +1634,20 @@ void ggml_hexagon_session::flush_pending(bool all) {
 
         HEX_VERBOSE("ggml-hex: %s dspcall wall=%lld us rsp_size=%u n_dbufs=%u legacy24=%d\n",
                 this->c_name(), (long long) (t1 - t0), rsp_size, n_dbufs, (int) legacy24);
+
+        // Dump first 64 responses to trace the sequence up to the ADD hang.
+        if (this->n_dspcall < 64) {
+            FILE * f = fopen("/data/local/tmp/npu/dspcall_seq.txt", "a");
+            if (f) {
+                const uint8_t * raw = (const uint8_t *) &rsp;
+                fprintf(f, "rsp#%llu id=%u status=%u n_bufs=%u n_tensors=%u n_ops=%u usecs=%u rsp_size=%u legacy24=%d raw24: ",
+                        (unsigned long long) this->n_dspcall, rsp.id, rsp.status,
+                        rsp.n_bufs, rsp.n_tensors, rsp.n_ops, rsp.usecs, rsp_size, (int) legacy24);
+                for (int k = 0; k < 24; k++) fprintf(f, "%02x ", raw[k]);
+                fprintf(f, "\n");
+                fclose(f);
+            }
+        }
 
         this->cum_dspcall_us += (t1 - t0);
         this->n_dspcall++;
@@ -3788,7 +3810,9 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
 
     // Queue and execute
     if (opt_opstage & HTP_OPSTAGE_QUEUE) {
+        fprintf(stderr, "[hex_graph_compute] n_nodes=%d n_htp_ops=%zu\n", graph->n_nodes, nodes_ptr->size());
         for (const auto & node : *nodes_ptr) {
+            fprintf(stderr, "[hex_op] opcode=%d dst=%s\n", (int)node.opcode, node.node->name);
             sess->enqueue_op(node);
         }
     }

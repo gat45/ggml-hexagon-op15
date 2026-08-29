@@ -1288,8 +1288,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     // pass 4.5: reorder nodes to group by backend (HTP first, CPU last)
     // This eliminates backend_switch splits by making all HTP ops consecutive
+    static const bool opt_pass45 = true; // reorder nodes to group by backend
     {
         const int n = graph->n_nodes;
+        if (opt_pass45) {
         fprintf(stderr, "[pass4.5] START n=%d n_backends=%d\n", n, sched->n_backends);
         if (n > 1) {
             // build in-degree and dependency tracking
@@ -1388,7 +1390,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             memcpy(graph->nodes, new_nodes, n * sizeof(struct ggml_tensor *));
             free(new_nodes);
             fprintf(stderr, "[pass4.5] APPLIED\n");
+            fflush(stderr);
         }
+        } // if (opt_pass45)
     }
 
     // pass 5: split graph, find tensors that need to be copied
@@ -1645,6 +1649,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; ++i) {
         sched->splits[i].graph.uid = ggml_graph_next_uid();
     }
+    fprintf(stderr, "[split_graph] DONE n_splits=%d n_nodes=%d n_leafs=%d\n", sched->n_splits, graph_copy->n_nodes, graph_copy->n_leafs);
+    fflush(stderr);
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
@@ -1702,6 +1708,8 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+
+    fprintf(stderr, "[compute_splits] START n_splits=%d\n", sched->n_splits); fflush(stderr);
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -1848,7 +1856,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
+            fprintf(stderr, "[compute] split %d/%d backend=%s n_nodes=%d ops:", split_id, sched->n_splits, ggml_backend_name(split_backend), split->graph.n_nodes);
+            for (int ni = 0; ni < split->graph.n_nodes; ni++) {
+                struct ggml_tensor * t = split->graph.nodes[ni];
+                fprintf(stderr, " %s", ggml_op_name(t->op));
+            }
+            fprintf(stderr, "\n"); fflush(stderr);
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            fprintf(stderr, "[compute] split %d DONE ec=%d\n", split_id, ec); fflush(stderr);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -2020,8 +2035,10 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     ggml_backend_sched_synchronize(sched);
 
     ggml_backend_sched_split_graph(sched, measure_graph);
+    fprintf(stderr, "[sched] split_graph DONE (reserve_n_size)\n"); fflush(stderr);
 
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+    fprintf(stderr, "[sched] reserve_n_size DONE\n"); fflush(stderr);
 }
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
@@ -2031,10 +2048,13 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     ggml_backend_sched_synchronize(sched);
 
     ggml_backend_sched_split_graph(sched, measure_graph);
+    fprintf(stderr, "[sched] split_graph DONE (reserve)\n"); fflush(stderr);
 
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+        fprintf(stderr, "[sched] reserve_n FAILED\n"); fflush(stderr);
         return false;
     }
+    fprintf(stderr, "[sched] reserve_n DONE\n"); fflush(stderr);
 
     ggml_backend_sched_reset(sched);
 
@@ -2050,10 +2070,13 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
     ggml_backend_sched_split_graph(sched, graph);
+    fprintf(stderr, "[sched] split_graph DONE (alloc)\n"); fflush(stderr);
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
+        fprintf(stderr, "[sched] alloc_splits FAILED\n"); fflush(stderr);
         return false;
     }
+    fprintf(stderr, "[sched] alloc_splits DONE\n"); fflush(stderr);
 
     sched->is_alloc = true;
 
