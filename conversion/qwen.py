@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from typing import Any, Callable, Iterable, TYPE_CHECKING
+from typing import Any, Callable, ContextManager, Iterable, TYPE_CHECKING, cast
 
 import numpy as np
 import torch
@@ -310,7 +310,42 @@ class _QwenMtpMixin:
         key = next((k for k in ["n_layers", "num_hidden_layers", "n_layer", "num_layers"] if k in hparams), None)
         type(self)._original_block_count = hparams.get(key)
         type(self).opt_num_mtp_layers = 0
-        return super().index_tensors(remote_hf_model_id=remote_hf_model_id)  # ty: ignore[unresolved-attribute]
+        tensors = super().index_tensors(remote_hf_model_id=remote_hf_model_id)
+
+        # Qwen3.5/3.6 checkpoints may store the MTP head fusion projection in a
+        # separate shard (e.g. `model-mtp-restored.safetensors`) that is not
+        # referenced by `model.safetensors.index.json`. Without it the GGUF is
+        # missing `blk.<block_count>.nextn.eh_proj` and llama.cpp refuses to
+        # load the model in MTP mode (`load_mtp` makes it a required tensor and
+        # the QWEN35 MTP draft graph asserts on it). Fold any `mtp.*` tensors
+        # from such extra shards into the export.
+        if remote_hf_model_id is None:
+            index_file = self.dir_model / "model.safetensors.index.json"
+            indexed_parts: set[str] = set()
+            if index_file.is_file():
+                with open(index_file, "r", encoding="utf-8") as f:
+                    indexed_parts.update((json.load(f).get("weight_map") or {}).values())
+
+            for part_name in ModelBase.get_model_part_names(self.dir_model, "model", ".safetensors"):
+                if part_name in indexed_parts:
+                    continue
+                logger.info(f"gguf: indexing extra model part '{part_name}'")
+                ctx = cast(ContextManager[Any], gguf.utility.SafetensorsLocal(self.dir_model / part_name))
+                with ctx as model_part:
+                    for name in model_part.keys():
+                        if not name.startswith("mtp."):
+                            continue
+                        data: gguf.utility.LocalTensor = model_part[name]
+                        if self.lazy:
+                            data_gen = lambda data=data: LazyTorchTensor.from_local_tensor(data)  # noqa: E731
+                        else:
+                            dtype = LazyTorchTensor._dtype_str_map[data.dtype]
+                            data_gen = lambda data=data, dtype=dtype: torch.from_numpy(data.mmap_bytes()).view(dtype).reshape(data.shape)  # noqa: E731
+                        if titem := self.filter_tensors((name, data_gen)):
+                            tname, tgen = titem
+                            tensors[tname] = tgen
+
+        return tensors
 
     @classmethod
     def filter_tensors(cls, item):
@@ -629,7 +664,7 @@ class _Qwen35MRopeMixin:
 
 @ModelBase.register("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM")
 @ModelBase.example("Qwen/Qwen3.5-9B")
-class Qwen3_5TextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
+class Qwen3_5TextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase, _QwenMtpMixin):
     model_arch = gguf.MODEL_ARCH.QWEN35
 
 

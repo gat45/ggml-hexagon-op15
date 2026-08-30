@@ -24,6 +24,7 @@
 #include <queue>
 #include <map>
 #include <string>
+#include <unordered_map>
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -1296,9 +1297,17 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         if (opt_pass45) {
         fprintf(stderr, "[pass4.5] START n=%d n_backends=%d\n", n, sched->n_backends);
         if (n > 1) {
-            // build in-degree and dependency tracking
+            // build in-degree and dependency tracking in O(n + E):
+            //   - node_index: pointer -> node index lookup (kills the linear scan)
+            //   - dependents: inverse adjacency list (decrement only touches consumers)
+            std::unordered_map<const struct ggml_tensor *, int> node_index;
+            node_index.reserve(n);
+            for (int i = 0; i < n; i++) {
+                node_index[graph->nodes[i]] = i;
+            }
             std::vector<int> in_degree(n, 0);
             std::vector<std::vector<int>> deps(n); // deps[i] = list of nodes that node i depends on
+            std::vector<std::vector<int>> dependents(n); // dependents[k] = list of nodes that depend on k
             fprintf(stderr, "[pass4.5] building deps...\n");
             for (int i = 0; i < n; i++) {
                 if (i % 1000 == 0) fprintf(stderr, "[pass4.5] deps i=%d/%d\n", i, n);
@@ -1306,13 +1315,23 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
                     if (src == NULL) continue;
-                    // find src in nodes array
-                    for (int k = 0; k < n; k++) {
-                        if (graph->nodes[k] == src) {
-                            deps[i].push_back(k);
-                            in_degree[i]++;
-                            break;
-                        }
+                    // find src in nodes array via hash map (O(1))
+                    auto it = node_index.find(src);
+                    if (it == node_index.end()) continue;
+                    const int k = it->second;
+                    // in_degree counts every src slot (incl. duplicates), exactly
+                    // like the O(n^2) version -> stranded nodes behave identically
+                    bool already = false;
+                    for (int d : deps[i]) {
+                        if (d == k) { already = true; break; }
+                    }
+                    deps[i].push_back(k);
+                    in_degree[i]++;
+                    // inverse adjacency: append each consumer ONCE per distinct
+                    // producer (decrement is once per (i,k) pair, preserving the
+                    // exact semantics of the O(n^2) break-once decrement)
+                    if (!already) {
+                        dependents[k].push_back(i);
                     }
                 }
             }
@@ -1359,16 +1378,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 if (sort_count % 1000 == 0) fprintf(stderr, "[pass4.5] sort processed=%d/%d pq_size=%d\n", sort_count, n, (int)pq.size());
 
                 // decrement in_degree for all nodes that depend on this one
-                for (int i = 0; i < n; i++) {
+                // O(out-degree of idx) via inverse adjacency list instead of O(n) scan
+                for (int i : dependents[idx]) {
                     if (visited[i]) continue;
-                    for (int k : deps[i]) {
-                        if (k == idx) {
-                            in_degree[i]--;
-                            if (in_degree[i] == 0) {
-                                pq.push(i);
-                            }
-                            break;
-                        }
+                    in_degree[i]--;
+                    if (in_degree[i] == 0) {
+                        pq.push(i);
                     }
                 }
             }

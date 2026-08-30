@@ -583,6 +583,151 @@ static void test_reallocation() {
     }
 }
 
+// ===========================================================================
+// TEST A (adversarial) — demonstrate the SILENT corruption when a memory plan
+// built on graph A is reused for a different graph B with the same counts and
+// per-position sizes but different lifetimes.
+//
+// Plan A (reserve):  n0=add(x0,x1) pos0 ; n1=mul(n0,x2) pos1 (reuses n0 inplace,
+//                    n0 dies after pos1) ; n2=add(x3,x4) pos2 (output)
+//   -> pos0->A0, pos1->A0 (inplace reuse of n0), pos2->A2
+// Graph B (compute): m0=add(y0,y1) pos0 ; m1=mul(y2,y3) pos1 (does NOT consume
+//                    m0) ; m2=add(m0,y4) pos2 (consumes m0 -> m0 is STILL ALIVE
+//                    at pos1)
+//   -> same n_nodes=3, same n_leafs=5, same per-position sizes 16/16/16
+//      -> ggml_gallocr_needs_realloc(graph B) == false  (BUG: identity not checked)
+//   -> plan A applied to B: pos1->A0 = address of m0 while m0 is still alive
+//      -> m0 and m1 are both alive at pos1 sharing A0 -> SILENT CORRUPTION
+// ===========================================================================
+static void test_adversarial_topology_change() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX);
+    ggml_gallocr_ptr galloc;
+
+    // ---- Graph A (reserve) ----
+    {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * x[5];
+        x[0] = make_input_with_size(ctx, 16);
+        x[1] = make_input_with_size(ctx, 16);
+        x[2] = make_input_with_size(ctx, 16);
+        x[3] = make_input_with_size(ctx, 16);
+        x[4] = make_input_with_size(ctx, 16);
+        ggml_tensor * n0 = ggml_add(ctx, x[0], x[1]);   // pos0
+        ggml_tensor * n1 = ggml_mul(ctx, n0, x[2]);     // pos1 (inplace-reuse of n0)
+        ggml_tensor * n2 = ggml_add(ctx, x[3], x[4]);   // pos2 (output)
+        assign_names(ctx);
+        ggml_set_output(n2);
+        // build each node separately to force node order [n0, n1, n2]
+        ggml_build_forward_expand(graph, n0);
+        ggml_build_forward_expand(graph, n1);
+        ggml_build_forward_expand(graph, n2);
+        GGML_ASSERT(graph->n_nodes == 3);
+        GGML_ASSERT(graph->n_leafs == 5);
+
+        int ids[3] = { 0, 0, 0 };
+        int lids[5] = { 0, 0, 0, 0, 0 };
+        galloc = ggml_gallocr_ptr(ggml_gallocr_new(&backend.buffer_type));
+        bool ok = ggml_gallocr_reserve_n(galloc.get(), graph, ids, lids);
+        GGML_ASSERT(ok);
+    }
+
+    // ---- Graph B (compute): same counts/sizes, DIFFERENT lifetimes ----
+    {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * y[5];
+        y[0] = make_input_with_size(ctx, 16);
+        y[1] = make_input_with_size(ctx, 16);
+        y[2] = make_input_with_size(ctx, 16);
+        y[3] = make_input_with_size(ctx, 16);
+        y[4] = make_input_with_size(ctx, 16);
+        ggml_tensor * m0 = ggml_add(ctx, y[0], y[1]);   // pos0 (ALIVE until pos2)
+        ggml_tensor * m1 = ggml_mul(ctx, y[2], y[3]);   // pos1 (does NOT consume m0)
+        ggml_tensor * m2 = ggml_add(ctx, m0, y[4]);     // pos2 (consumes m0)
+        assign_names(ctx);
+        ggml_set_output(m2);
+        // build each node separately to force node order [m0, m1, m2]
+        ggml_build_forward_expand(graph, m0);
+        ggml_build_forward_expand(graph, m1);
+        ggml_build_forward_expand(graph, m2);
+        GGML_ASSERT(graph->n_nodes == 3);
+        GGML_ASSERT(graph->n_leafs == 5);
+
+        int ids[3] = { 0, 0, 0 };
+        int lids[5] = { 0, 0, 0, 0, 0 };
+
+        // THE BUG: alloc_graph accepts graph B reusing the plan built on A,
+        // because needs_realloc only checks counts + per-position sizes.
+        bool result = ggml_gallocr_alloc_graph(galloc.get(), graph);
+        ggml_tensor * n0 = ggml_graph_node(graph, 0); // m0
+        ggml_tensor * n1 = ggml_graph_node(graph, 1); // m1
+        ggml_tensor * n2 = ggml_graph_node(graph, 2); // m2
+
+        // m0 is still alive at pos1 (it is consumed by m2 at pos2)
+        bool m0_alive_at_pos1 = false;
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            if (n2->src[s] == n0) m0_alive_at_pos1 = true;
+        }
+
+        printf("  [A] alloc_graph(B with plan of A) returned: %s (BUG: should be rejected/true only if valid)\n", result ? "true" : "false");
+        printf("  [A] n_nodes=%d n_leafs=%d (equal to reserve graph)\n", graph->n_nodes, graph->n_leafs);
+        printf("  [A] m0 (pos0) alive at pos1 (consumed by m2 at pos2): %s\n", m0_alive_at_pos1 ? "YES" : "no");
+        printf("  [A] m0.data = %p , m1.data = %p\n", (void *) n0->data, (void *) n1->data);
+        bool overlap = memory_overlap(n0, n1);
+        printf("  [A] memory_overlap(m0, m1) = %s -> ", overlap ? "TRUE" : "false");
+        if (overlap && m0_alive_at_pos1) {
+            printf("SILENT CORRUPTION: two simultaneously-live tensors share the same slot\n");
+        } else {
+            printf("no corruption in this instance\n");
+        }
+
+        // can_reuse_memory(m1 at pos1 over m0) must be false (m0 has a future consumer)
+        bool reusable = can_reuse_memory(graph, 1, n1, n0);
+        printf("  [A] can_reuse_memory(m1, m0) = %s (if false + overlap => check_no_overlap would FAIL)\n", reusable ? "true" : "false");
+        printf("  [A] CONCLUSION: %s\n",
+              (result && overlap && m0_alive_at_pos1 && !reusable) ?
+              "BUG DEMONSTRATED: stale plan silently applied -> live-live overlap" :
+              "no overlap produced (plan happened to be compatible)");
+
+        // --- REGRESSION ASSERTS (B: the diagnostic MUST catch it) ---
+        // The whole point of the diagnostic tool: counts/sizes can't see the
+        // change, but the per-position structural signature can.
+        int n_mismatch = ggml_gallocr_debug_mismatch_count(galloc.get());
+        printf("  [A] diagnostic mismatches detected = %d\n", n_mismatch);
+        GGML_ASSERT(n_mismatch > 0 && "diagnostic must detect the plan/identity mismatch");
+        GGML_ASSERT(overlap && m0_alive_at_pos1 && "sanity: this adversarial case must actually produce the overlap");
+    }
+
+    // --- NO-FALSE-POSITIVE check: re-allocate the SAME graph A again ---
+    // After a reserve, allocating an identical graph must NOT raise the diagnostic.
+    {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * x[5];
+        x[0] = make_input_with_size(ctx, 16);
+        x[1] = make_input_with_size(ctx, 16);
+        x[2] = make_input_with_size(ctx, 16);
+        x[3] = make_input_with_size(ctx, 16);
+        x[4] = make_input_with_size(ctx, 16);
+        ggml_tensor * n0 = ggml_add(ctx, x[0], x[1]);
+        ggml_tensor * n1 = ggml_mul(ctx, n0, x[2]);
+        ggml_tensor * n2 = ggml_add(ctx, x[3], x[4]);
+        assign_names(ctx);
+        ggml_set_output(n2);
+        ggml_build_forward_expand(graph, n0);
+        ggml_build_forward_expand(graph, n1);
+        ggml_build_forward_expand(graph, n2);
+        GGML_ASSERT(graph->n_nodes == 3 && graph->n_leafs == 5);
+        int ids[3] = { 0, 0, 0 };
+        int lids[5] = { 0, 0, 0, 0, 0 };
+        bool ok = ggml_gallocr_reserve_n(galloc.get(), graph, ids, lids);
+        GGML_ASSERT(ok);
+        bool result = ggml_gallocr_alloc_graph(galloc.get(), graph);
+        GGML_ASSERT(result);
+        int n_mismatch = ggml_gallocr_debug_mismatch_count(galloc.get());
+        printf("  [A] NO-FALSE-POSITIVE: re-alloc identical graph, mismatches = %d\n", n_mismatch);
+        GGML_ASSERT(n_mismatch == 0 && "identical graph must not trigger the diagnostic");
+    }
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -604,5 +749,6 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_adversarial_topology_change (DEMO — prints proof, no assert)", test_adversarial_topology_change);
     return 0;
 }

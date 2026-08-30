@@ -18,6 +18,40 @@
 //#define AT_PRINTF(...) GGML_LOG_DEBUG(__VA_ARGS__)
 #define AT_PRINTF(...)
 
+// ---- DIAGNOSTIC plan fingerprint (no behavioral effect) ----
+// Structural+positional hash of the tensor at a graph position: op, shape,
+// view chain, buffer id. NOT a proof of plan validity — only a detector for
+// gross identity changes that counts/sizes cannot see.
+static uint64_t ggml_gallocr_tensor_signature(const struct ggml_tensor * t, int buffer_id) {
+    uint64_t h = 1469598103934665603ULL; // FNV offset basis
+#define HASH_BYTE(b) do { h ^= (uint64_t)(uint8_t)(b); h *= 1099511628211ULL; } while (0)
+    HASH_BYTE((uint8_t) t->op);
+    for (int d = 0; d < GGML_MAX_DIMS; d++) {
+        for (int b = 0; b < 8; b++) HASH_BYTE((uint8_t)(t->ne[d] >> (8*b)));
+    }
+    const struct ggml_tensor * v = t;
+    while (v->view_src) { v = v->view_src; }
+    for (int b = 0; b < (int) sizeof(void*); b++) HASH_BYTE((uint8_t)((uintptr_t) v >> (8*b)));
+    for (int b = 0; b < (int) sizeof(int); b++) HASH_BYTE((uint8_t)(buffer_id >> (8*b)));
+    return h;
+#undef HASH_BYTE
+}
+
+static uint64_t ggml_gallocr_node_signature(const struct ggml_tensor * node, int node_buffer_id) {
+    uint64_t h = ggml_gallocr_tensor_signature(node, node_buffer_id);
+    for (int j = 0; j < GGML_MAX_SRC; j++) {
+        const struct ggml_tensor * src = node->src[j];
+        if (src == NULL) {
+            h ^= 0x9e3779b97f4a7c15ULL;
+            h *= 1099511628211ULL;
+        } else {
+            h ^= ggml_gallocr_tensor_signature(src, -1);
+            h *= 1099511628211ULL;
+        }
+    }
+    return h;
+}
+
 // ops that return true for this function must not use restrict pointers for their backend implementations
 bool ggml_op_can_inplace(enum ggml_op op) {
     switch (op) {
@@ -477,6 +511,12 @@ struct leaf_alloc {
 struct node_alloc {
     struct tensor_alloc dst;
     struct tensor_alloc src[GGML_MAX_SRC];
+
+    // DIAGNOSTIC ONLY (no behavioral effect): structural+positional fingerprint
+    // of the tensor the plan was built for. Allows needs_realloc() to REPORT
+    // (but not enforce) a graph whose identity differs from the plan's graph
+    // while counts/sizes happen to match.
+    uint64_t debug_signature;
 };
 
 struct ggml_gallocr {
@@ -493,6 +533,11 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    // DIAGNOSTIC ONLY: number of plan/identity mismatches detected by
+    // needs_realloc() since the last reserve. Log-only; never alters behavior.
+    // Exposed via ggml_gallocr_debug_mismatch_count() for regression tests.
+    int debug_mismatch_count;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -843,6 +888,7 @@ static bool ggml_gallocr_reserve_n_impl(
     for (int i = 0; i < galloc->n_buffers; i++) {
         ggml_dyn_tallocr_reset(galloc->buf_tallocs[i]);
     }
+    galloc->debug_mismatch_count = 0;
 
     // allocate in hash table
     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
@@ -880,6 +926,8 @@ static bool ggml_gallocr_reserve_n_impl(
                 node_alloc->src[j].size_max = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], src);
             }
         }
+        // DIAGNOSTIC: fingerprint of the tensor the plan position i was built for
+        node_alloc->debug_signature = ggml_gallocr_node_signature(node, node_alloc->dst.buffer_id);
     }
     if (galloc->n_leafs < graph->n_leafs) {
         free(galloc->leaf_allocs);
@@ -1024,6 +1072,18 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
+
+        // DIAGNOSTIC ONLY: report (but not enforce) a plan/identity mismatch.
+        // This is exactly the silent-corruption window of test_adversarial
+        // (same counts, same sizes, different tensor at position i). A real
+        // enforcement would require a formal plan-validity proof, which a hash
+        // cannot provide — hence log-only.
+        uint64_t sig = ggml_gallocr_node_signature(node, node_alloc->dst.buffer_id);
+        if (node_alloc->debug_signature != 0 && node_alloc->debug_signature != sig) {
+            galloc->debug_mismatch_count++;
+            GGML_LOG_ERROR("%s: DIAGNOSTIC plan/identity mismatch at node %d (%s): plan signature %016llx, current %016llx (counts/sizes matched, but tensor at this position differs from the one the plan was built for — possible silent corruption if plan is reused)\n",
+                __func__, i, node->name, (unsigned long long) node_alloc->debug_signature, (unsigned long long) sig);
+        }
 
         if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
 #ifndef NDEBUG
@@ -1246,4 +1306,8 @@ ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft(struct ggml_conte
 
 ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors(struct ggml_context * ctx, ggml_backend_t backend) {
     return ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(backend));
+}
+
+int ggml_gallocr_debug_mismatch_count(ggml_gallocr_t galloc) {
+    return galloc->debug_mismatch_count;
 }

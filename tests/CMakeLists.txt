@@ -360,6 +360,8 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp)
+    # Determinism of pass-4.5 topological reorder (standalone, no ggml deps)
+    llama_build_and_test(test-pass45-determinism.cpp)
 endif()
 
 llama_build(test-export-graph-ops.cpp)
