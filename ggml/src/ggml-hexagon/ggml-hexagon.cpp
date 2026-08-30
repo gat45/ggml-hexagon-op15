@@ -65,6 +65,7 @@ static size_t opt_nhvx    = 0; // use all
 static int    opt_nhmx    = 1; // when set, enable HMX; when 0, use HVX only
 static size_t opt_vmem    = HTP_OP_MAX_VMEM_DEFAULT;  // max available va space for buffer mappings
 static size_t opt_mbuf    = 1ul * 1024 * 1024 * 1024; // max buffer size
+static int64_t opt_mm_rows = 32768;                    // max rows for quantized MUL_MAT (lm-head limit)
 static int    opt_etm     = 0;
 static int    opt_verbose = 0;
 static int    opt_profile = 0; // profiling mode (0-disabled, 1-basic, 2-pmu)
@@ -2910,8 +2911,9 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
                 return false;
             }
 
-            // hardcoded limit to refuse the lm-head for now
-            if (src0->ne[1] > 32768) {
+            // configurable limit for quantized MUL_MAT rows (lm-head offload)
+            // default 32768; set GGML_HEXAGON_MAX_MUL_MAT_ROWS to raise it
+            if (src0->ne[1] > opt_mm_rows) {
                 return false;
             }
 
@@ -4524,6 +4526,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
     const char * str_vmem     = getenv("GGML_HEXAGON_VMEM");
     const char * str_mbuf     = getenv("GGML_HEXAGON_MBUF");
+    const char * str_mm_rows  = getenv("GGML_HEXAGON_MAX_MUL_MAT_ROWS");
     const char * str_optrace  = getenv("GGML_HEXAGON_OPTRACE");
 
     // Init Arch first since it affects other defaults
@@ -4574,6 +4577,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf)                      : opt_hostbuf;
     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;
     opt_vmem      = str_vmem     ? strtoul(str_vmem, NULL, 0) * MiB       : opt_vmem;
+    opt_mm_rows   = str_mm_rows  ? strtoll(str_mm_rows, NULL, 0)          : opt_mm_rows;
 
     if (opt_ndev > GGML_HEXAGON_MAX_SESSIONS) {
         opt_ndev = GGML_HEXAGON_MAX_SESSIONS;
