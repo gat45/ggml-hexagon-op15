@@ -117,6 +117,134 @@ static bool                  ggml_hexagon_compute_fa_params(const ggml_backend_h
 GGML_BACKEND_API void       ggml_hexagon_set_runtime_libpath(const char * path);
 
 // =================================================================================================
+//  live JSONL trace sink (variante MEMPOOL/FastRPC — port du hook dspqueue)
+//  ================================================================================================
+//
+// Gated uniquement par GGML_HEXAGON_TRACE_JSON=/chemin/trace.jsonl. Format
+// consommé par profile_model.py --live-trace (voir INSTRUMENTATION.md).
+//
+// DIFFÉRENCE ARCHITECTURALE HONNÊTE avec la variante dspqueue : le transport
+// mempool soumet TOUT le graphe en UN seul doorbell FastRPC synchrone
+// (ggml_htp_execute_batch) et ne reçoit AUCUN profiler par-op du DSP — il n'y
+// a pas de pop avec htp_prof_desc[] comme dans l'opqueue partagé. Ce hook émet
+// donc deux flux véridiques :
+//   1. un événement BATCH par invocation avec la latence RÉELLE mesurée côté
+//      AP (graph_dur) + n_ops + n_tensors — en decode chaque token ≈ 1 appel,
+//      donc la série BATCH est le t/s wall par token ;
+//   2. au build d'un graphe (cache-miss), un événement par op MUL_MAT/
+//      MUL_MAT_ID/NX avec le CHEMIN EXÉCUTÉ réel (kernel_type -> hmx-tiled /
+//      hvx-tiled / hvx-flat / hvx-ddr) + tailles VTCM du kernel_params — ces
+//      événements portent path/spill mais PAS de latence par-op (indisponible
+//      dans ce transport : aucun événement 0 µs déguisé en mesure).
+//
+// Les événements BATCH portent kernel="BATCH" et sont agrégés par
+// aggregate_live_trace() comme mesure wall réelle (per_kernel).
+static FILE *      g_hex_trace_json      = nullptr;
+static std::mutex  g_hex_trace_json_mtx;
+
+static void ggml_hexagon_trace_json_init() {
+    const char * path = getenv("GGML_HEXAGON_TRACE_JSON");
+    if (path && *path) {
+        g_hex_trace_json = fopen(path, "a");
+        if (!g_hex_trace_json) {
+            GGMLHEXAGON_LOG_ERROR("trace-json: impossible d'ouvrir GGML_HEXAGON_TRACE_JSON=%s", path);
+        } else {
+            GGMLHEXAGON_LOG_ALWAYS("trace-json (mempool): %s", path);
+        }
+    }
+}
+
+static void ggml_hexagon_trace_json_close() {
+    if (g_hex_trace_json) {
+        fclose(g_hex_trace_json);
+        g_hex_trace_json = nullptr;
+    }
+}
+
+// Extrait un index de couche depuis un nom de tenseur GGUF/ggml, ex.
+// "blk.12.attn_q.weight" -> 12. Retourne -1 si aucun pattern "blk.N." /
+// "layers.N." trouvé (même convention que classify() côté profile_model.py).
+static int ggml_hexagon_layer_from_name(const char * name) {
+    if (!name) return -1;
+    static const std::regex re("(?:blk|layers)\\.(\\d+)\\.");
+    std::cmatch m;
+    if (std::regex_search(name, m, re)) {
+        return atoi(m[1].str().c_str());
+    }
+    return -1;
+}
+
+static int ggml_hexagon_layer_from_tensors(const ggml_tensor * const * tensors, int n) {
+    for (int i = 0; i < n; i++) {
+        if (!tensors[i]) continue;
+        int layer = ggml_hexagon_layer_from_name(tensors[i]->name);
+        if (layer >= 0) return layer;
+    }
+    return -1;
+}
+
+// Décodage du chemin exécuté par un MUL_MAT à partir du kernel_params (le
+// même blob que consomme le DSP). spill=true si repli flat/DDR (layout tuilé
+// > budget VTCM) — l'équivalent réel d'un spill fill.
+static const char * ggml_hexagon_trace_mm_path(const struct htp_mm_kernel_params * kp, bool * spill) {
+    *spill = false;
+    if (!kp) return "unknown";
+    switch (kp->kernel_type) {
+        case HTP_MM_KERNEL_HMX_2D:
+        case HTP_MM_KERNEL_HMX_F16_BATCHED:
+            return "hmx-tiled";
+        case HTP_MM_KERNEL_HVX_F16_F16_VTCM:
+        case HTP_MM_KERNEL_HVX_F32_F32_VTCM:
+        case HTP_MM_KERNEL_HVX_QUANT_ROW:
+        case HTP_MM_KERNEL_HVX_QUANT_BLOCK:
+            return "hvx-tiled";
+        case HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT:
+            *spill = true;
+            return "hvx-flat";
+        case HTP_MM_KERNEL_HVX_F16_F16_DDR:
+        case HTP_MM_KERNEL_HVX_F16_F32_DDR:
+        case HTP_MM_KERNEL_HVX_F32_F32_DDR:
+        case HTP_MM_KERNEL_HVX_F32_F16_DDR:
+            *spill = true;
+            return "hvx-ddr";
+        default:
+            return "unknown";
+    }
+}
+
+static void ggml_hexagon_trace_json_write_mm(const char * kernel, const ggml_tensor * const * tensors, int n_tensors,
+                                             const char * path, double vtcm_mb,
+                                             double w_mb, double a_mb, double d_mb, bool spill) {
+    if (!g_hex_trace_json) return;
+    int layer = ggml_hexagon_layer_from_tensors(tensors, n_tensors);
+    std::lock_guard<std::mutex> lock(g_hex_trace_json_mtx);
+    if (layer >= 0) {
+        fprintf(g_hex_trace_json,
+                "{\"layer\": %d, \"kernel\": \"%s\", \"path\": \"%s\", \"vtcm_mb\": %.4f, "
+                "\"w_mb\": %.4f, \"a_mb\": %.4f, \"d_mb\": %.4f, \"spill\": %s}\n",
+                layer, kernel, path, vtcm_mb, w_mb, a_mb, d_mb, spill ? "true" : "false");
+    } else {
+        fprintf(g_hex_trace_json,
+                "{\"layer\": \"?\", \"kernel\": \"%s\", \"path\": \"%s\", \"vtcm_mb\": %.4f, "
+                "\"w_mb\": %.4f, \"a_mb\": %.4f, \"d_mb\": %.4f, \"spill\": %s}\n",
+                kernel, path, vtcm_mb, w_mb, a_mb, d_mb, spill ? "true" : "false");
+    }
+    fflush(g_hex_trace_json);
+}
+
+// Événement BATCH : latence RÉELLE d'une invocation mempool (AP-side).
+static void ggml_hexagon_trace_json_write_batch(int64_t latency_us, int64_t dsp_exec_us,
+                                                uint32_t n_ops, uint32_t n_tensors) {
+    if (!g_hex_trace_json) return;
+    std::lock_guard<std::mutex> lock(g_hex_trace_json_mtx);
+    fprintf(g_hex_trace_json,
+            "{\"layer\": \"?\", \"kernel\": \"BATCH\", \"latency_us\": %.2f, "
+            "\"dsp_exec_us\": %.2f, \"n_ops\": %u, \"n_tensors\": %u}\n",
+            (double) latency_us, (double) dsp_exec_us, n_ops, n_tensors);
+    fflush(g_hex_trace_json);
+}
+
+// =================================================================================================
 //  section-2: data structures
 // =================================================================================================
 enum qcom_htp_arch {
@@ -5532,6 +5660,56 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         }
     }
 
+    // ---- Trace (mempool) : chemin exécuté par op MUL_MAT, une fois par
+    // graphe (build/cache-miss). Le kernel_params est celui que le DSP va
+    // réellement exécuter (même blob copié dans le batch desc Phase 8) : on
+    // émet path + tailles VTCM véridiques, SANS prétendre à une latence
+    // par-op (le transport mempool n'en retourne pas). Les événements BATCH
+    // (après invoke, plus bas) portent la latence réelle par invocation.
+    if (g_hex_trace_json && !cache_hit) {
+        const double MB = 1024.0 * 1024.0;
+        for (size_t i = 0; i < hex_ops.size(); i++) {
+            const hex_op_desc & o = hex_ops[i];
+            const bool is_mm = (o.opcode == GGML_OP_MUL_MAT) ||
+                               (o.opcode == GGML_OP_MUL_MAT_ID);
+            if (!is_mm) continue;
+            const auto * kp = (const struct htp_mm_kernel_params *) o.kernel_params;
+            // kparams non rempli (op validée mais non précomputée sur ce chemin,
+            // ex. MUL_MAT_ID hors support batch) -> on ne prétend rien.
+            if (!kp || kp->kernel_type == HTP_MM_KERNEL_UNSUPPORTED || kp->vtcm_size == 0) {
+                continue;
+            }
+            bool spill = false;
+            const char * path = ggml_hexagon_trace_mm_path(kp, &spill);
+            // Layer : src0 (poids blk.N.*) puis dst, via la table tensor_src.
+            const ggml_tensor * cand[2] = { nullptr, nullptr };
+            int n_cand = 0;
+            if (o.dst_idx[0] >= 0 && (uint32_t)o.dst_idx[0] < tensor_src.size()) {
+                cand[n_cand++] = tensor_src[o.dst_idx[0]];
+            }
+            if (o.src_idx[0] >= 0 && (uint32_t)o.src_idx[0] < tensor_src.size()) {
+                cand[n_cand++] = tensor_src[o.src_idx[0]];
+            }
+            // Nom de kernel : fusion éventuelle (QKV/FFN/ADD) via htp_opcode.
+            const char * kname = "MUL_MAT";
+            if (o.opcode == GGML_OP_MUL_MAT_ID) {
+                kname = "MUL_MAT_ID";
+            } else if (o.htp_opcode == HTP_OP_MUL_MAT_ADD) {
+                kname = "MUL_MAT+ADD";
+            } else if (o.htp_opcode == HTP_OP_MUL_MAT_QKV) {
+                kname = "MUL_MAT_QKV";
+            } else if (o.htp_opcode == HTP_OP_MUL_MAT_FFN) {
+                kname = "MUL_MAT_FFN";
+            }
+            ggml_hexagon_trace_json_write_mm(kname, cand, n_cand, path,
+                                             kp ? (double) kp->vtcm_size / MB : 0.0,
+                                             kp ? (double) kp->vtcm_src0_size / MB : 0.0,
+                                             kp ? (double) kp->vtcm_src1_size / MB : 0.0,
+                                             kp ? (double) kp->vtcm_dst_size / MB : 0.0,
+                                             spill);
+        }
+    }
+
     t_p3 = t_start; t_start = ggml_time_us(); ctx->cum_p3_us += t_start - t_p3;
 
     // ---- Phase 4: compute layout sizes ----
@@ -5913,6 +6091,12 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     }
 
     t_p9 = t_p9_post - t_p9_pre;
+    // Trace (mempool) : latence RÉELLE de l'invocation (doorbell complet). En
+    // decode chaque token ≈ un appel -> la série BATCH est le t/s wall/token.
+    // dsp_exec_us = t_p9 (temps synchrone invoke = DSP + RPC round-trip).
+    if (g_hex_trace_json) {
+        ggml_hexagon_trace_json_write_batch(t_p9, t_p9, n_ops, n_tensors);
+    }
     ctx->cum_p9_us += t_p9;
     ctx->cum_p9_dsp_exec_us  += t_p9;
     // rpc_setup = AP-side cost before the invoke entry
@@ -6464,6 +6648,7 @@ static int ggml_backend_hexagon_get_device_count() {
 }
 
 static void ggml_backend_hexagon_atexit_cleanup() {
+    ggml_hexagon_trace_json_close();
     if (g_reg_ctx) {
         delete g_reg_ctx;
         g_reg_ctx = nullptr;
@@ -6529,6 +6714,8 @@ ggml_backend_reg_t ggml_backend_hexagon_reg() {
                 GGMLHEXAGON_LOG_ERROR("htpdrv_init failed with error %d", ret);
                 return nullptr;
             }
+
+            ggml_hexagon_trace_json_init();
 
             int ndev = g_hexagon_appcfg.ndev;
             ggml_backend_hexagon_reg_context * ctx = new ggml_backend_hexagon_reg_context;
