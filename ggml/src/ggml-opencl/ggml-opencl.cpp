@@ -11164,17 +11164,19 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
 }
 
 static size_t ggml_backend_opencl_buffer_type_get_alignment(ggml_backend_buffer_type_t buffer_type) {
-    ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer_type->device->context;
-    return dev_ctx->backend_ctx->alignment;
+    // Lazily init the backend context on first buft use (e.g. when a tensor
+    // buft override routes allocation here without the OpenCL backend ever
+    // being instantiated, as with -dev HTP0). alloc_buffer already does this;
+    // without it dev_ctx->backend_ctx is NULL -> SIGSEGV in get_alignment.
+    ggml_backend_opencl_context * backend_ctx = ggml_cl_init(buffer_type->device);
+    return backend_ctx->alignment;
 }
 
 static size_t ggml_backend_opencl_buffer_type_get_max_size(ggml_backend_buffer_type_t buffer_type) {
-    static size_t max_size = -1;
-    if (max_size == (size_t)-1) {
-        ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer_type->device->context;
-        max_size = dev_ctx->backend_ctx->max_alloc_size;
-    }
-    return max_size;
+    // see get_alignment: lazily init instead of deref-ing a possibly-NULL
+    // dev_ctx->backend_ctx
+    ggml_backend_opencl_context * backend_ctx = ggml_cl_init(buffer_type->device);
+    return backend_ctx->max_alloc_size;
 }
 
 static bool ggml_backend_opencl_buffer_type_supports_backend(ggml_backend_buffer_type_t buft, ggml_backend_t backend) {
@@ -11194,8 +11196,10 @@ static size_t ggml_backend_opencl_buffer_type_get_alloc_size(ggml_backend_buffer
     // subbuffer would overlap the next tensor in the pool. Reserve the worst-case
     // carve slack: at most 5 components (q5_K), i.e. 4 aligned gaps.
     if (ggml_is_quantized(tensor->type)) {
-        ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buft->device->context;
-        size += 4 * dev_ctx->backend_ctx->alignment;
+        // see get_alignment: lazily init instead of deref-ing a possibly-NULL
+        // dev_ctx->backend_ctx
+        ggml_backend_opencl_context * backend_ctx = ggml_cl_init(buft->device);
+        size += 4 * backend_ctx->alignment;
     }
 #endif // GGML_OPENCL_SOA_Q
     return size;
