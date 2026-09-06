@@ -933,7 +933,15 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
     if (tensor->buffer || (tensor->view_src && tensor->view_src->buffer)) {
         // since the tensor is pre-allocated, it cannot be moved to another backend
         ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-        GGML_ABORT("pre-allocated tensor (%s) in a buffer (%s) that cannot run the operation (%s)", tensor->name, ggml_backend_buffer_name(buffer), ggml_op_name(tensor->op));
+        if (tensor->op != GGML_OP_NONE) {
+            GGML_ABORT("pre-allocated tensor (%s) in a buffer (%s) that cannot run the operation (%s)", tensor->name, ggml_backend_buffer_name(buffer), ggml_op_name(tensor->op));
+        }
+        // pre-allocated weight (op==NONE) in a foreign buffer (e.g. -ot ...=OpenCL):
+        // do not abort - fall through so the op using it is assigned to a backend
+        // that supports the op, and the weight becomes a split input that
+        // compute_splits copies via ggml_backend_tensor_copy (same path as CPU
+        // host weights). The abort above only applies to op results that cannot
+        // be relocated.
     }
 
     // graph input
@@ -1525,7 +1533,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                 }
 
-                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                // Copy the input when its buffer is not directly usable by this
+                // split backend. backend-id equality is not sufficient: a weight
+                // pre-allocated in a foreign buft (e.g. -ot ...=OpenCL) may be
+                // assigned to this backend (pass 4 "4.cur") while its buffer is
+                // unsupported (hexagon refuses it, OpenCL not in the sched), so
+                // src_backend_id == cur_backend_id yet the raw data pointer is a
+                // device fake ptr -> CPU would deref garbage. Buffer compatibility
+                // alone covers both cases (cross-backend and cross-buft).
+                if (!ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
