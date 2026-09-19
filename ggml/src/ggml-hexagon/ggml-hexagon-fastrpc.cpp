@@ -332,6 +332,10 @@ struct hexagon_appcfg_t {
     int dump_diag_info;         // enable/disable dump diag info for troubleshooting issues on HTP side
     int ndev;                   // number of Hexagon devices (PDs), from GGML_HEXAGON_NDEV env
     int rpc_mmap_mode;          // 0=FASTRPC_MAP_FD_DELAYED (default), 1=FASTRPC_MAP_FD (eager pinning)
+    int rpc_mmap_extended;      // P0-H: 1=map mempool via FASTRPC_MAP_FD_[DELAYED_]EXTENDED into the DSP
+                                //   extended (>=4 GiB) VA space. Gated on probed EXTENDED_MAP_SUPPORT.
+    int rpc_mempool_mib;        // P0-H: if >0, first mempool target in MiB (overrides stock ladder;
+                                //   lets experiments request pools >4 GiB without rebuilding)
     int enable_opfusion;        // 1=enable QKV/FFN op fusion (default), 0=disable (for debugging)
     int fa_select;              // flash attention: 2=HMX->HVX->CPU, 1=HVX->CPU, 0=CPU (default 2)
     int dsp_cache_mode;         // NPU-side entry.c cache optimization bitmask, pushed to NPU at init via
@@ -375,6 +379,8 @@ static struct hexagon_appcfg_t g_hexagon_appcfg = {
         .dump_diag_info         = 0,
         .ndev                   = 1,
         .rpc_mmap_mode          = 0,
+        .rpc_mmap_extended      = 0,
+        .rpc_mempool_mib        = 0,
         .enable_opfusion        = 1,
         .fa_select              = 2,
         .dsp_cache_mode         = 5,
@@ -897,6 +903,8 @@ static void ggmlhexagon_load_cfg() {
     hexagoncfg_instance.get_intvalue("cdsp", "dump_diag_info", g_hexagon_appcfg.dump_diag_info, 0);
     hexagoncfg_instance.get_intvalue("cdsp", "ndev", g_hexagon_appcfg.ndev, 1);
     hexagoncfg_instance.get_intvalue("cdsp", "rpc_mmap_mode", g_hexagon_appcfg.rpc_mmap_mode, 0);
+    hexagoncfg_instance.get_intvalue("cdsp", "rpc_mmap_extended", g_hexagon_appcfg.rpc_mmap_extended, 0);
+    hexagoncfg_instance.get_intvalue("cdsp", "rpc_mempool_mib", g_hexagon_appcfg.rpc_mempool_mib, 0);
     hexagoncfg_instance.get_intvalue("cdsp", "enable_opfusion", g_hexagon_appcfg.enable_opfusion, 1);
     hexagoncfg_instance.get_intvalue("cdsp", "fa_select", g_hexagon_appcfg.fa_select, 2);
     hexagoncfg_instance.get_intvalue("cdsp", "dsp_cache_mode", g_hexagon_appcfg.dsp_cache_mode, 5);
@@ -931,6 +939,23 @@ static void ggmlhexagon_load_cfg() {
         g_hexagon_appcfg.ndev = 1;
     }
     GGMLHEXAGON_LOG_ALWAYS("ndev=%d (from cfg, env GGML_HEXAGON_NDEV overrides if set)", g_hexagon_appcfg.ndev);
+
+    // P0-H env overrides (automation/testing): extended-VA mapping + custom mempool target
+    const char * str_ext = getenv("GGML_HEXAGON_RPC_MMAP_EXTENDED");
+    if (str_ext) {
+        g_hexagon_appcfg.rpc_mmap_extended = atoi(str_ext) ? 1 : 0;
+    }
+    const char * str_pool = getenv("GGML_HEXAGON_MEMPOOL_MIB");
+    if (str_pool) {
+        int v = atoi(str_pool);
+        if (v >= 256) {
+            g_hexagon_appcfg.rpc_mempool_mib = v;
+        } else {
+            GGMLHEXAGON_LOG_WARN("invalid GGML_HEXAGON_MEMPOOL_MIB=%d, must be >=256; using cfg/default", v);
+        }
+    }
+    GGMLHEXAGON_LOG_ALWAYS("rpc_mmap_extended=%d, rpc_mempool_mib=%d (cfg; env GGML_HEXAGON_RPC_MMAP_EXTENDED/GGML_HEXAGON_MEMPOOL_MIB override)",
+                           g_hexagon_appcfg.rpc_mmap_extended, g_hexagon_appcfg.rpc_mempool_mib);
 
     ggmlhexagon_set_runtime_path(0, g_hexagon_appcfg.runtime_libpath);
 
@@ -1493,11 +1518,42 @@ static int ggmlhexagon_init_rpcmempool(ggml_backend_hexagon_context * ctx) {
     // fine, 4024 MiB fails (dsp_register_rpcmem 0x80000401) — so the first
     // target is 3968 (pool = target - 8 = 3960 MiB) to skip the known-failing
     // attempt instead of logging a warning on every init.
+    // P0-H: custom first target (cfg rpc_mempool_mib / env GGML_HEXAGON_MEMPOOL_MIB) — lets the
+    // extended-VA experiment request pools >4 GiB (or any size) without rebuilding.
+    size_t targets_custom[2] = { 0, 0 };
+    size_t   n_custom        = 0;
+    if (g_hexagon_appcfg.rpc_mempool_mib > 0) {
+        targets_custom[n_custom++] = (size_t)g_hexagon_appcfg.rpc_mempool_mib;
+        size_t half = (size_t)g_hexagon_appcfg.rpc_mempool_mib / 2;
+        if (half >= 1024) {
+            targets_custom[n_custom++] = half;
+        }
+    }
     size_t targets_79plus[] = { 3968, 3840, 3072, 2560, 2048, 1536, 1024 };
     size_t targets_legacy[] = { 3830, 3072, 2048 };
-    size_t * targets        = (htp_arch > 75) ? targets_79plus : targets_legacy;
-    size_t   n_targets      = (htp_arch > 75) ? sizeof(targets_79plus) / sizeof(targets_79plus[0])
+    size_t * stock_targets  = (htp_arch > 75) ? targets_79plus : targets_legacy;
+    size_t   n_stock        = (htp_arch > 75) ? sizeof(targets_79plus) / sizeof(targets_79plus[0])
                                               : sizeof(targets_legacy) / sizeof(targets_legacy[0]);
+    size_t * targets        = (n_custom > 0) ? targets_custom : stock_targets;
+    size_t   n_targets      = (n_custom > 0) ? n_custom : n_stock;
+    // P0-H: map mode resolved once, before the target loop (probe already ran).
+    enum fastrpc_map_flags mmap_flags = (g_hexagon_appcfg.rpc_mmap_mode == 1)
+                                        ? FASTRPC_MAP_FD
+                                        : FASTRPC_MAP_FD_DELAYED;
+    const char * mmap_mode_str = (g_hexagon_appcfg.rpc_mmap_mode == 1) ? "EAGER" : "DELAYED";
+    const char * mmap_ext_str  = "";
+    if (g_hexagon_appcfg.rpc_mmap_extended) {
+        if (ctx->has_extended_map) {
+            mmap_flags   = (g_hexagon_appcfg.rpc_mmap_mode == 1) ? FASTRPC_MAP_FD_EXTENDED
+                                                                 : FASTRPC_MAP_FD_DELAYED_EXTENDED;
+            mmap_ext_str = "-EXT";
+            GGMLHEXAGON_LOG_ALWAYS("rpc mmap: EXTENDED VA mode (FASTRPC_MAP_FD%s)",
+                                   (g_hexagon_appcfg.rpc_mmap_mode == 1) ? "" : "_DELAYED");
+        } else {
+            GGMLHEXAGON_LOG_WARN("rpc_mmap_extended=1 but EXTENDED_MAP_SUPPORT=0 on domain %d — stock mapping",
+                                 ctx->domain_id);
+        }
+    }
     for (size_t i = 0; i < n_targets; i++) {
         size_t pool_size = targets[i] - 8;
         uint8_t * buf = static_cast<uint8_t *>(rpcmem_alloc2(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, pool_size * SIZE_IN_MB));
@@ -1508,8 +1564,8 @@ static int ggmlhexagon_init_rpcmempool(ggml_backend_hexagon_context * ctx) {
         ctx->rpc_mempool          = buf;
         ctx->rpc_mempool_capacity = targets[i] * SIZE_IN_MB;
         ctx->rpc_mempool_len      = pool_size * SIZE_IN_MB;
-        GGMLHEXAGON_LOG_ALWAYS("rpc mempool: %zu MiB allocated (target %zu MiB, device %d)",
-                                pool_size, targets[i], ctx->device);
+        GGMLHEXAGON_LOG_ALWAYS("rpc mempool: %zu MiB allocated (target %zu MiB, device %d%s)",
+                                pool_size, targets[i], ctx->device, mmap_ext_str);
 
         ctx->rpc_mempool_handle = rpcmem_to_fd(ctx->rpc_mempool);
         if (ctx->rpc_mempool_handle < 0) {
@@ -1524,14 +1580,19 @@ static int ggmlhexagon_init_rpcmempool(ggml_backend_hexagon_context * ctx) {
         // Register mempool with FastRPC kernel driver.
         // rpc_mmap_mode = 0: FASTRPC_MAP_FD_DELAYED (default), defers NPU-side mapping until HAP_mmap2().
         // rpc_mmap_mode = 1: FASTRPC_MAP_FD (eager), creates immediate kernel-level mapping and pins pages.
-        enum fastrpc_map_flags mmap_flags = (g_hexagon_appcfg.rpc_mmap_mode == 1)
-                                            ? FASTRPC_MAP_FD
-                                            : FASTRPC_MAP_FD_DELAYED;
-        const char * mmap_mode_str = (g_hexagon_appcfg.rpc_mmap_mode == 1) ? "EAGER" : "DELAYED";
+        // P0-H: mmap_flags/mmap_ext_str resolved before the loop (extended-VA gate).
         int mmap_err = fastrpc_mmap(ctx->domain_id, ctx->rpc_mempool_handle, ctx->rpc_mempool, 0, ctx->rpc_mempool_len, mmap_flags);
         if (mmap_err != 0) {
-            GGMLHEXAGON_LOG_ERROR("fastrpc_mmap(%s) returned %d (fd=%d), trying next smaller target",
-                                   mmap_mode_str, mmap_err, ctx->rpc_mempool_handle);
+            GGMLHEXAGON_LOG_ERROR("fastrpc_mmap(%s%s) returned %d (fd=%d), trying next smaller target",
+                                   mmap_mode_str, mmap_ext_str, mmap_err, ctx->rpc_mempool_handle);
+            if (mmap_ext_str[0]) {
+                // Kernel driver rejected the EXTENDED flag — downgrade once so smaller
+                // targets still map instead of killing the whole init.
+                GGMLHEXAGON_LOG_WARN("extended map rejected (err 0x%x) — downgrading to stock mapping",
+                                     mmap_err);
+                mmap_flags   = (g_hexagon_appcfg.rpc_mmap_mode == 1) ? FASTRPC_MAP_FD : FASTRPC_MAP_FD_DELAYED;
+                mmap_ext_str = "";
+            }
             rpcmem_free(ctx->rpc_mempool);
             ctx->rpc_mempool = nullptr;
             continue;
