@@ -70,6 +70,8 @@ static int    opt_etm     = 0;
 static int    opt_verbose = 0;
 static int    opt_profile = 0; // profiling mode (0-disabled, 1-basic, 2-pmu)
 static int    opt_hostbuf = 1; // hostbuf ON by default
+static int    opt_expert_trace = 0;
+static std::string opt_expert_trace_run_id;
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
@@ -149,7 +151,7 @@ static const char * htp_event_name(uint16_t id) {
     }
 }
 
-static void ggml_hexagon_dump_op_prof(const std::string &sess_name, const htp_opnode & node, const htp_prof_desc & pd) {
+static void ggml_hexagon_dump_op_prof(const std::string & sess_name, uint64_t token_index, const htp_opnode & node, const htp_prof_desc & pd) {
     if (!opt_profile) return;
 
     uint32_t op_usec = pd.usecs;
@@ -165,9 +167,13 @@ static void ggml_hexagon_dump_op_prof(const std::string &sess_name, const htp_op
 
     htp_opformat fmt(node);
     float mhz = op_usec > 0 ? (float) op_cycles / op_usec : 0.0f;
-    GGML_LOG_DEBUG("ggml-hex: %s profile-op %s|%s|%s|%s|%s|%s|usec %u cycles %u start %u mhz %.1f%s\n", sess_name.c_str(),
-            node.op_name().c_str(), fmt.names, fmt.dims, fmt.types, fmt.strides, fmt.kparams, op_usec, op_cycles, pd.cycles_start, mhz, pmu_str);
+    GGML_LOG_DEBUG("ggml-hex: %s profile-op %s|%s|%s|%s|%s|%s|usec %u cycles %u start %u mhz %.1f%s%s\n", sess_name.c_str(),
+            node.op_name().c_str(), fmt.names, fmt.dims, fmt.types, fmt.strides, fmt.kparams, op_usec, op_cycles, pd.cycles_start, mhz, pmu_str,
+            opt_expert_trace ? (std::string(" run_id ") + opt_expert_trace_run_id + " token_index " + std::to_string(token_index)).c_str() : "");
 }
+
+struct ggml_hexagon_session;
+static void ggml_hexagon_dump_expert_trace(const ggml_hexagon_session & sess, const htp_opnode & node, const htp_prof_desc & pd);
 
 static void ggml_hexagon_dump_batch_prof(const std::string & sess_name, const htp_opbatch_rsp & rsp) {
     uint64_t batch_cycles = rsp.cycles_stop - rsp.cycles_start;
@@ -291,6 +297,7 @@ struct ggml_hexagon_session {
     uint64_t dspcall_max_us  = 0;
     int64_t  cum_wait_us     = 0;
     uint64_t n_wait          = 0;
+    uint64_t expert_trace_token_index = 0;
 
     struct {
         uint64_t uid = 0;
@@ -311,6 +318,40 @@ struct ggml_hexagon_session {
     void flush_pending(bool all = false);
     void flush_batch();
 };
+
+static int ggml_hexagon_expert_layer(const ggml_tensor * tensor) {
+    int layer = -1;
+    if (tensor && sscanf(tensor->name, "blk.%d.", &layer) == 1) {
+        return layer;
+    }
+    return -1;
+}
+
+static void ggml_hexagon_dump_expert_trace(const ggml_hexagon_session & sess, const htp_opnode & node, const htp_prof_desc & pd) {
+    if (!opt_expert_trace || node.opcode != HTP_OP_MUL_MAT_ID) {
+        return;
+    }
+
+    const ggml_tensor * weights = node.node->src[0];
+    const ggml_tensor * ids     = node.node->src[2];
+    if (!weights || !ids || ids->type != GGML_TYPE_I32 || !ids->data || ids->ne[1] != 1) {
+        return;
+    }
+
+    const int layer = ggml_hexagon_expert_layer(weights);
+    if (layer < 0) {
+        return;
+    }
+
+    const int32_t * expert_ids = static_cast<const int32_t *>(ids->data);
+    const size_t requested_bytes = weights->nb[2];
+    for (int64_t rank = 0; rank < ids->ne[0]; ++rank) {
+        GGML_LOG_DEBUG("ggml-moe: expert-trace {\"run_id\":\"%s\",\"token_index\":%llu,\"layer\":%d,\"expert_id\":%d,\"rank\":%lld,\"hit\":false,\"cache_tier\":\"none\",\"tensor_name\":\"%s\",\"requested_bytes\":%zu,\"loaded_bytes\":%zu,\"htp_compute_us\":%u}\n",
+                       opt_expert_trace_run_id.c_str(),
+                       (unsigned long long) sess.expert_trace_token_index, layer, expert_ids[rank],
+                       (long long) rank, weights->name, requested_bytes, requested_bytes, pd.usecs);
+    }
+}
 
 // ** backend buffers
 
@@ -335,6 +376,7 @@ struct ggml_hexagon_shared_buffer {
     void mmap() {
         fastrpc_map_flags flags = this->pinned ? FASTRPC_MAP_FD : FASTRPC_MAP_FD_DELAYED;
 
+        int64_t t0 = opt_expert_trace ? ggml_time_us() : 0;
         int err = fastrpc_mmap(sess->domain_id, this->fd, (void *) this->base, 0, this->size, flags);
         if (err != 0) {
             GGML_LOG_ERROR("ggml-hex: %s buffer mapping failed : domain_id %d size %zu fd %d error 0x%08x\n", sess->c_name(),
@@ -346,11 +388,18 @@ struct ggml_hexagon_shared_buffer {
                 sess->c_name(), (void *) this->base, this->size, this->fd, pinned);
 
         this->mapped = true;
+        if (opt_expert_trace) {
+            GGML_LOG_DEBUG("ggml-moe: expert-map {\"run_id\":\"%s\",\"event\":\"map\",\"fd\":%d,\"bytes\":%zu,\"duration_us\":%lld,\"pinned\":%s}\n",
+                           opt_expert_trace_run_id.c_str(), this->fd, this->size,
+                           (long long) (ggml_time_us() - t0), pinned ? "true" : "false");
+        }
     }
 
     void unmap() {
         if (!this->mapped) return;
 
+        const int fd = this->fd;
+        int64_t t0 = opt_expert_trace ? ggml_time_us() : 0;
         if (!this->pinned) {
             // HTP might still hold a reference, tell it drop it
             htp_iface_munmap(sess->handle, this->fd);
@@ -363,6 +412,11 @@ struct ggml_hexagon_shared_buffer {
 
         this->mapped = false;
         this->fd     = -1;
+        if (opt_expert_trace) {
+            GGML_LOG_DEBUG("ggml-moe: expert-map {\"run_id\":\"%s\",\"event\":\"unmap\",\"fd\":%d,\"bytes\":%zu,\"duration_us\":%lld,\"pinned\":%s}\n",
+                           opt_expert_trace_run_id.c_str(), fd, this->size,
+                           (long long) (ggml_time_us() - t0), pinned ? "true" : "false");
+        }
     }
 
     void alloc(size_t size) {
@@ -1562,7 +1616,8 @@ struct ggml_hexagon_opqueue {
             ggml_hexagon_dump_batch_prof(shm_buf->sess->name, rsp);
 
             for (uint32_t i = 0; i < rsp.n_ops; i++) {
-                ggml_hexagon_dump_op_prof(shm_buf->sess->name, ops[i], pd[i]);
+                ggml_hexagon_dump_op_prof(shm_buf->sess->name, shm_buf->sess->expert_trace_token_index, ops[i], pd[i]);
+                ggml_hexagon_dump_expert_trace(*shm_buf->sess, ops[i], pd[i]);
             }
 
             ggml_hexagon_dump_trace_events(shm_buf->sess->name, rsp, trace_events, n_traces);
@@ -3820,6 +3875,15 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         }
     }
 
+    uint64_t expert_trace_tokens = 0;
+    if (opt_expert_trace) {
+        for (const auto & node : *nodes_ptr) {
+            if (node.opcode == HTP_OP_MUL_MAT_ID && node.node->src[2]) {
+                expert_trace_tokens = std::max(expert_trace_tokens, (uint64_t) node.node->src[2]->ne[1]);
+            }
+        }
+    }
+
     // Queue and execute
     if (opt_opstage & HTP_OPSTAGE_QUEUE) {
         int64_t q0 = ggml_time_us();
@@ -3848,6 +3912,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         }
         (void)q0; (void)q2;
     }
+
+    sess->expert_trace_token_index += expert_trace_tokens;
 
     return GGML_STATUS_SUCCESS;
 }
@@ -4517,6 +4583,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_opfusion = getenv("GGML_HEXAGON_OPFUSION");
     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
+    const char * str_expert_trace = getenv("GGML_EXPERT_TRACE");
+    const char * str_expert_trace_run_id = getenv("GGML_EXPERT_TRACE_RUN_ID");
     const char * str_etm      = getenv("GGML_HEXAGON_ETM");
     const char * str_nhvx     = getenv("GGML_HEXAGON_NHVX");
     const char * str_use_hmx  = getenv("GGML_HEXAGON_USE_HMX");
@@ -4569,6 +4637,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
     opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
     opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
+    opt_expert_trace = str_expert_trace ? atoi(str_expert_trace)          : 0;
+    opt_expert_trace_run_id = str_expert_trace_run_id ? str_expert_trace_run_id : "";
     opt_etm       = str_etm      ? atoi(str_etm)                          : 0;
     opt_nhvx      = str_nhvx     ? strtoul(str_nhvx, NULL, 0)             : opt_nhvx;
     opt_nhmx      = str_nhmx     ? atoi(str_nhmx)                         : (str_use_hmx ? atoi(str_use_hmx) : opt_nhmx);
