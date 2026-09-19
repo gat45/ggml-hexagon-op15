@@ -355,6 +355,19 @@ static void ggml_hexagon_dump_expert_trace(const ggml_hexagon_session & sess, co
 
 // ** backend buffers
 
+// P0-H dspqueue-variant fallback: no fastrpc.cpp appcfg in this build — read the
+// env override directly. Weak symbol: the strong definition in
+// ggml-hexagon-fastrpc.cpp (mempool variant, cfg+env) wins when both TUs link.
+extern "C" __attribute__((weak)) void ggml_hexagon_get_rpc_mmap_cfg(int * out_extended, int * out_mmap_mode) {
+    if (out_extended) {
+        const char * s = getenv("GGML_HEXAGON_RPC_MMAP_EXTENDED");
+        *out_extended = (s && atoi(s)) ? 1 : 0;
+    }
+    if (out_mmap_mode) {
+        *out_mmap_mode = 0;
+    }
+}
+
 struct ggml_backend_hexagon_buffer_type_context {
     ggml_backend_hexagon_buffer_type_context(const std::string & name, ggml_hexagon_session * sess) {
         this->sess = sess;
@@ -375,9 +388,24 @@ struct ggml_hexagon_shared_buffer {
 
     void mmap() {
         fastrpc_map_flags flags = this->pinned ? FASTRPC_MAP_FD : FASTRPC_MAP_FD_DELAYED;
+        // P0-H: honor the extended-VA policy from ggml-hexagon-fastrpc.cpp appcfg.
+        // No per-domain probe here — the kernel driver enforces; on rejection we
+        // retry once with the stock flag below.
+        int cfg_extended = 0, cfg_mode = 0;
+        ggml_hexagon_get_rpc_mmap_cfg(&cfg_extended, &cfg_mode);
+        const bool want_ext = (cfg_extended == 1);
+        if (want_ext) {
+            flags = this->pinned ? FASTRPC_MAP_FD_EXTENDED : FASTRPC_MAP_FD_DELAYED_EXTENDED;
+        }
 
         int64_t t0 = opt_expert_trace ? ggml_time_us() : 0;
         int err = fastrpc_mmap(sess->domain_id, this->fd, (void *) this->base, 0, this->size, flags);
+        if (err != 0 && want_ext) {
+            GGML_LOG_WARN("ggml-hex: %s extended buffer mapping failed (0x%08x) — retrying stock mapping\n",
+                          sess->c_name(), (unsigned) err);
+            flags = this->pinned ? FASTRPC_MAP_FD : FASTRPC_MAP_FD_DELAYED;
+            err   = fastrpc_mmap(sess->domain_id, this->fd, (void *) this->base, 0, this->size, flags);
+        }
         if (err != 0) {
             GGML_LOG_ERROR("ggml-hex: %s buffer mapping failed : domain_id %d size %zu fd %d error 0x%08x\n", sess->c_name(),
                     sess->domain_id, this->size, this->fd, (unsigned) err);
@@ -389,9 +417,10 @@ struct ggml_hexagon_shared_buffer {
 
         this->mapped = true;
         if (opt_expert_trace) {
-            GGML_LOG_DEBUG("ggml-moe: expert-map {\"run_id\":\"%s\",\"event\":\"map\",\"fd\":%d,\"bytes\":%zu,\"duration_us\":%lld,\"pinned\":%s}\n",
+            GGML_LOG_DEBUG("ggml-moe: expert-map {\"run_id\":\"%s\",\"event\":\"map\",\"fd\":%d,\"bytes\":%zu,\"duration_us\":%lld,\"pinned\":%s,\"ext\":%s}\n",
                            opt_expert_trace_run_id.c_str(), this->fd, this->size,
-                           (long long) (ggml_time_us() - t0), pinned ? "true" : "false");
+                           (long long) (ggml_time_us() - t0), pinned ? "true" : "false",
+                           want_ext ? "true" : "false");
         }
     }
 

@@ -88,6 +88,10 @@ extern "C" {
 #     define DSPQUEUE_TIMEOUT 1000000
 #endif
 
+/* P0-H: extended-VA mapping policy shared with the tensor-buffer path
+ * (ggml-hexagon.cpp ggml_hexagon_shared_buffer::mmap honors the same appcfg). */
+HTPDRV_API void ggml_hexagon_get_rpc_mmap_cfg(int * out_extended, int * out_mmap_mode);
+
 /**
  * htpdrv_init API: driver interface entry point
  *
