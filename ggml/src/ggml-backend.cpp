@@ -880,17 +880,53 @@ static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backen
     return -1;
 }
 
+// [SCHEDPROBE] decision audit for backend_from_buffer: for a given (op, weight buffer
+// type) pair, record why each candidate backend was kept or rejected. Gated by env
+// GGML_SCHED_PROBE=1, read once; one summary line per distinct decision, capped to
+// keep device logs usable (first 40 distinct ops only).
+static int  ggml_sched_probe_enabled = -1; // -1 = not yet read from env
+static size_t ggml_sched_probe_lines = 0;
+#define GGML_SCHED_PROBE_MAX_LINES 40
+static bool ggml_sched_probe_active(void) {
+    if (ggml_sched_probe_enabled == -1) {
+        const char * e = getenv("GGML_SCHED_PROBE");
+        ggml_sched_probe_enabled = (e && atoi(e)) ? 1 : 0;
+    }
+    return ggml_sched_probe_enabled == 1;
+}
+
 static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, const struct ggml_tensor * tensor, const struct ggml_tensor * op) {
     ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     if (buffer == NULL) {
         return -1;
     }
 
+    const bool probe = ggml_sched_probe_active();
+    bool probe_logged[GGML_SCHED_MAX_BACKENDS] = { false };
+
     // find highest prio backend that supports the buffer type and the op
     for (int i = 0; i < sched->n_backends; i++) {
         if (ggml_backend_supports_buft(sched->backends[i], buffer->buft) &&
             ggml_backend_supports_op(sched->backends[i], op)) {
+            if (probe && ggml_sched_probe_lines < GGML_SCHED_PROBE_MAX_LINES) {
+                ggml_sched_probe_lines++;
+                GGML_LOG_ERROR("[schedprobe] '%s' op=%s buft=%s -> backend[%d]=%s (accepted first match)\n",
+                    tensor->name, ggml_op_desc(op), ggml_backend_buft_name(buffer->buft),
+                    i, ggml_backend_name(sched->backends[i]));
+            }
             return i;
+        }
+        if (probe) {
+            const bool ok_buft = ggml_backend_supports_buft(sched->backends[i], buffer->buft);
+            const bool ok_op   = ok_buft ? ggml_backend_supports_op(sched->backends[i], op) : false;
+            if (ok_buft && !ok_op && !probe_logged[i] && ggml_sched_probe_lines < GGML_SCHED_PROBE_MAX_LINES) {
+                // log once per backend per decision point: buft OK but op refused
+                probe_logged[i] = true;
+                ggml_sched_probe_lines++;
+                GGML_LOG_ERROR("[schedprobe] '%s' op=%s buft=%s -> backend[%d]=%s REJECT-OP (buft ok)\n",
+                    tensor->name, ggml_op_desc(op), ggml_backend_buft_name(buffer->buft),
+                    i, ggml_backend_name(sched->backends[i]));
+            }
         }
     }
 
@@ -971,6 +1007,11 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+                    if (ggml_sched_probe_active() && ggml_sched_probe_lines < GGML_SCHED_PROBE_MAX_LINES) {
+                        ggml_sched_probe_lines++;
+                        GGML_LOG_ERROR("[schedprobe] offload check: '%s' op=%s (hexagon offload_op is NULL, this path can only fire for backends implementing offload_op)\n",
+                            tensor->name, ggml_op_desc(tensor));
+                    }
                     for (int b = 0; b < src_backend_id; b++) {
                         if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
                             SET_CAUSE(tensor, "1.off");
@@ -1300,10 +1341,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     // pass 4.5: reorder nodes to group by backend (HTP first, CPU last)
     // This eliminates backend_switch splits by making all HTP ops consecutive
     static const bool opt_pass45 = true; // reorder nodes to group by backend
+    // [SCHEDPROBE] pass4.5 progress logs are gated behind GGML_SCHED_PROBE=1:
+    // they fire per graph evaluation (every token), so unconditional fprintf
+    // here is a measurable overhead on device (measured -4..-7% tg with logs on).
+    const bool probe_pass45 = ggml_sched_probe_active();
     {
         const int n = graph->n_nodes;
         if (opt_pass45) {
-        fprintf(stderr, "[pass4.5] START n=%d n_backends=%d\n", n, sched->n_backends);
+        if (probe_pass45) fprintf(stderr, "[pass4.5] START n=%d n_backends=%d\n", n, sched->n_backends);
         if (n > 1) {
             // build in-degree and dependency tracking in O(n + E):
             //   - node_index: pointer -> node index lookup (kills the linear scan)
@@ -1316,9 +1361,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             std::vector<int> in_degree(n, 0);
             std::vector<std::vector<int>> deps(n); // deps[i] = list of nodes that node i depends on
             std::vector<std::vector<int>> dependents(n); // dependents[k] = list of nodes that depend on k
-            fprintf(stderr, "[pass4.5] building deps...\n");
+            if (probe_pass45) fprintf(stderr, "[pass4.5] building deps...\n");
             for (int i = 0; i < n; i++) {
-                if (i % 1000 == 0) fprintf(stderr, "[pass4.5] deps i=%d/%d\n", i, n);
+                if (probe_pass45 && i % 1000 == 0) fprintf(stderr, "[pass4.5] deps i=%d/%d\n", i, n);
                 struct ggml_tensor * node = graph->nodes[i];
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
@@ -1343,7 +1388,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                 }
             }
-            fprintf(stderr, "[pass4.5] deps DONE\n");
+            if (probe_pass45) fprintf(stderr, "[pass4.5] deps DONE\n");
 
             // topological sort with backend affinity:
             // prefer nodes on non-CPU backends (HTP), then by in-degree
@@ -1373,7 +1418,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     zero_count++;
                 }
             }
-            fprintf(stderr, "[pass4.5] sort: zero_in_degree=%d pq_size=%d\n", zero_count, (int)pq.size());
+            if (probe_pass45) fprintf(stderr, "[pass4.5] sort: zero_in_degree=%d pq_size=%d\n", zero_count, (int)pq.size());
 
             int sort_count = 0;
             while (!pq.empty()) {
@@ -1383,7 +1428,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 visited[idx] = true;
                 result.push_back(idx);
                 sort_count++;
-                if (sort_count % 1000 == 0) fprintf(stderr, "[pass4.5] sort processed=%d/%d pq_size=%d\n", sort_count, n, (int)pq.size());
+                if (probe_pass45 && sort_count % 1000 == 0) fprintf(stderr, "[pass4.5] sort processed=%d/%d pq_size=%d\n", sort_count, n, (int)pq.size());
 
                 // decrement in_degree for all nodes that depend on this one
                 // O(out-degree of idx) via inverse adjacency list instead of O(n) scan
@@ -1395,7 +1440,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                 }
             }
-            fprintf(stderr, "[pass4.5] sort DONE processed=%d result_size=%d\n", sort_count, (int)result.size());
+            if (probe_pass45) fprintf(stderr, "[pass4.5] sort DONE processed=%d result_size=%d\n", sort_count, (int)result.size());
 
             // handle any remaining nodes (cycles or view ops)
             int remaining = 0;
@@ -1405,7 +1450,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     remaining++;
                 }
             }
-            fprintf(stderr, "[pass4.5] remaining=%d total_result=%d\n", remaining, (int)result.size());
+            if (probe_pass45) fprintf(stderr, "[pass4.5] remaining=%d total_result=%d\n", remaining, (int)result.size());
 
             // apply reordering
             struct ggml_tensor ** new_nodes = (struct ggml_tensor **)malloc(n * sizeof(struct ggml_tensor *));
@@ -1414,8 +1459,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
             memcpy(graph->nodes, new_nodes, n * sizeof(struct ggml_tensor *));
             free(new_nodes);
-            fprintf(stderr, "[pass4.5] APPLIED\n");
-            fflush(stderr);
+            if (probe_pass45) {
+                fprintf(stderr, "[pass4.5] APPLIED\n");
+                fflush(stderr);
+            }
         }
         } // if (opt_pass45)
     }
@@ -1571,6 +1618,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     if (sched->debug) {
         ggml_backend_sched_print_assignments(sched, graph);
+    }
+
+    // [SCHEDPROBE] per-graph topology summary: splits and copies are the ground
+    // truth for "HTP0 alone = CPU fallback" diagnostics (upstream #23314 showed
+    // ~187 splits with HTP0 alone vs ~2 with GPUOpenCL). One line per graph.
+    if (ggml_sched_probe_active()) {
+        int probe_total_inputs = sched->n_graph_inputs;
+        for (int i = 0; i < sched->n_splits; i++) {
+            probe_total_inputs += sched->splits[i].n_inputs;
+        }
+        fprintf(stderr, "[schedprobe] graph: n_nodes=%d n_splits=%d copies_needed=%d n_backends=%d\n",
+            graph->n_nodes, sched->n_splits, probe_total_inputs, sched->n_backends);
+        fflush(stderr);
     }
 
     // swap node_backend_ids and leaf _backend_ids with prevs

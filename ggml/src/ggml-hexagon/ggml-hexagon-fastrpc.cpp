@@ -957,6 +957,13 @@ static void ggmlhexagon_load_cfg() {
     GGMLHEXAGON_LOG_ALWAYS("rpc_mmap_extended=%d, rpc_mempool_mib=%d (cfg; env GGML_HEXAGON_RPC_MMAP_EXTENDED/GGML_HEXAGON_MEMPOOL_MIB override)",
                            g_hexagon_appcfg.rpc_mmap_extended, g_hexagon_appcfg.rpc_mempool_mib);
 
+    // [SCHEDPROBE] confirm the OPFILTER override is armed (one line at init)
+    {
+        const char * of = getenv("GGML_HEXAGON_OPFILTER");
+        GGMLHEXAGON_LOG_ALWAYS("opfilter=%s (env GGML_HEXAGON_OPFILTER, regex on op names, empty = disabled)",
+                               of && of[0] ? of : "<off>");
+    }
+
     ggmlhexagon_set_runtime_path(0, g_hexagon_appcfg.runtime_libpath);
 
     initialized = true;
@@ -4378,6 +4385,18 @@ static bool hexagon_validate_gated_delta_net(ggml_backend_hexagon_context * ctx,
 // Initialized once at first call via init_op_validators().
 static hexagon_op_validator_t s_op_validators[GGML_OP_COUNT];
 
+// [SCHEDPROBE] shared with can_handle_op_through_cdsp: env gate + line cap for
+// REJECT-BUFT logs (first 40 only, keeps device logcat usable).
+static int    ggmlhexagon_probe_rejects_enabled = -1; // -1 = not yet read from env
+static size_t ggmlhexagon_probe_reject_lines    = 0;
+static bool ggmlhexagon_probe_rejects_active(void) {
+    if (ggmlhexagon_probe_rejects_enabled == -1) {
+        const char * e = getenv("GGML_HEXAGON_PROBE_REJECTS");
+        ggmlhexagon_probe_rejects_enabled = (e && atoi(e)) ? 1 : 0;
+    }
+    return ggmlhexagon_probe_rejects_enabled == 1;
+}
+
 static void init_op_validators(void) {
     static bool s_initialized = false;
     if (s_initialized) return;
@@ -4424,7 +4443,32 @@ static bool ggmlhexagon_can_handle_op_through_cdsp(ggml_backend_dev_t dev, const
         return true;
     }
 
+    // [SCHEDPROBE] runtime op filter, mirrors GGML_HEXAGON_OPFILTER from the
+    // sessions variant (ggml-hexagon.cpp) which is NOT compiled in mempool
+    // builds. Lets the A/B matrix (FLASH_ATTN_EXT off / MUL_MAT off / ...) run
+    // on device without touching code. Gated env, read once.
+    static int      s_opfilter_enabled = -1; // -1 = not yet read from env
+    static std::regex * s_opfilter     = nullptr;
+    if (s_opfilter_enabled == -1) {
+        const char * e = getenv("GGML_HEXAGON_OPFILTER");
+        s_opfilter_enabled = e ? 1 : 0;
+        if (e) {
+            s_opfilter = new std::regex(e, std::regex::icase | std::regex::optimize);
+        }
+    }
+    if (s_opfilter && std::regex_match(ggml_op_desc(op_tensor), *s_opfilter)) {
+        return false;
+    }
+
     if (!ggmlhexagon_op_buffers_belong_to_dev(dev, op_tensor)) {
+        // [SCHEDPROBE] log the first rejections of this kind: this is the exact
+        // "HTP0 alone = CPU fallback" mechanism - one src in a foreign buffer
+        // (CPU/OpenCL) makes the whole op fall back, whatever the validator says.
+        if (ggmlhexagon_probe_rejects_active() && ggmlhexagon_probe_reject_lines < 40) {
+            ggmlhexagon_probe_reject_lines++;
+            GGMLHEXAGON_LOG_WARN("[schedprobe] '%s' op=%s REJECT-BUFT (dst+srcs must be hexagon/repack buft of this device)",
+                                 op_tensor->name, ggml_op_desc(op_tensor));
+        }
         return false;
     }
 
