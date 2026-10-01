@@ -1073,16 +1073,26 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
 
-        // DIAGNOSTIC ONLY: report (but not enforce) a plan/identity mismatch.
-        // This is exactly the silent-corruption window of test_adversarial
-        // (same counts, same sizes, different tensor at position i). A real
-        // enforcement would require a formal plan-validity proof, which a hash
-        // cannot provide — hence log-only.
+        // Fix for https://github.com/ggml-org/llama.cpp/issues/28448 : the stock
+        // checks below (ggml_gallocr_node_needs_realloc) only compare node/leaf
+        // COUNTS and per-position byte SIZE — never identity. A dynamic-topology
+        // graph (sparse-MoE routing is the clearest trigger) can keep counts/sizes
+        // stable while a DIFFERENT tensor occupies position i, which silently
+        // reuses a stale offset table (two live tensors sharing one slot, no
+        // crash, no assertion). ggml_gallocr_node_signature() hashes op+shape+
+        // view_src+srcs+buffer_id — cheap and already computed for every node —
+        // so a mismatch here IS a certain identity change (a 64-bit hash
+        // collision here is not the failure mode: the false path is "we allow a
+        // real slot reuse we couldn't afford", the true path is "we force one
+        // extra realloc" — asymmetric enough that erring toward realloc is the
+        // only safe default per PR #13222's own precedent). Force a realloc for
+        // this graph precisely when the fingerprint changes at a fixed position.
         uint64_t sig = ggml_gallocr_node_signature(node, node_alloc->dst.buffer_id);
         if (node_alloc->debug_signature != 0 && node_alloc->debug_signature != sig) {
             galloc->debug_mismatch_count++;
-            GGML_LOG_ERROR("%s: DIAGNOSTIC plan/identity mismatch at node %d (%s): plan signature %016llx, current %016llx (counts/sizes matched, but tensor at this position differs from the one the plan was built for — possible silent corruption if plan is reused)\n",
+            GGML_LOG_ERROR("%s: plan/identity mismatch at node %d (%s): plan signature %016llx, current %016llx (counts/sizes matched, but tensor at this position differs from the one the plan was built for — forcing realloc to avoid silent corruption)\n",
                 __func__, i, node->name, (unsigned long long) node_alloc->debug_signature, (unsigned long long) sig);
+            return true;
         }
 
         if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
