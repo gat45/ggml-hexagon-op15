@@ -5571,7 +5571,13 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                 if (didx < n_tensors) dst_indices[didx] = 1;
             }
             for (const auto & op : hex_ops) {
-                if (op.opcode == GGML_OP_MUL_MAT) {
+                // MUL_MAT_ID weights (src0 of the router op) MUST be included:
+                // expert weights are never dst of a MUL_MAT, so without this
+                // they keep original (non-tiled) strides in the descriptor and
+                // op_matmul_id addresses experts at the wrong offset — silent
+                // garbage on every repacked type (test-backend-ops 0/380 FAIL,
+                // while F16/F32/BF16 which are never repacked passed 160/160).
+                if (op.opcode == GGML_OP_MUL_MAT || op.opcode == GGML_OP_MUL_MAT_ID) {
                     uint32_t sidx = op.src_idx[0];
                     if (sidx < n_tensors && !dst_indices[sidx] &&
                         !ctx->ever_dst_ptrs.count(tensor_src[sidx]->data)) {
