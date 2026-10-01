@@ -266,6 +266,22 @@ struct ggml_backend_hexagon_context {
     uint64_t n_hmx_vtcm_pass           = 0;     // HMX VTCM precompute succeeded
     uint64_t n_hmx_vtcm_fail           = 0;     // HMX VTCM precompute failed
 
+    // [MMIDPROBE] MUL_MAT_ID routing counters (P0.1/P0.3, uncapped).
+    // sched_* = admission (supports_op); batch_* = reached op-descriptor build.
+    uint64_t n_mmid_seen_sched         = 0;  // MMID nodes offered to supports_op
+    uint64_t n_mmid_reject_buft        = 0;  // rejected: dst/srcs in foreign buffer
+    uint64_t n_mmid_reject_novalidator = 0;  // rejected: no validator registered (snapshot behavior)
+    uint64_t n_mmid_reject_generic     = 0;  // rejected by generic mul_mat validator
+    uint64_t n_mmid_claimed            = 0;  // supports_op returned true
+    uint64_t n_mmid_reject_type        = 0;  // dedicated: src1/dst/src2 type invariant
+    uint64_t n_mmid_reject_prec        = 0;  // dedicated: GGML_PREC_F32 requested (PR #29348)
+    uint64_t n_mmid_reject_quant       = 0;  // dedicated: src0 type not in quant whitelist
+    uint64_t n_mmid_reject_layout      = 0;  // dedicated: contiguity/permutation/QK alignment
+    uint64_t n_mmid_reject_vtcm        = 0;  // dedicated: kernel UNSUPPORTED / VTCM over budget
+    uint64_t n_mmid_validate_pass      = 0;  // dedicated validator passed
+    uint64_t n_mmid_seen_batch         = 0;  // MMID nodes reaching batch descriptor build
+    uint64_t n_mmid_hmx                = 0;  // MMID dispatched to HMX kernels
+
     // Buffer type owned by this context (each device has its own buft)
     struct ggml_backend_buffer_type buffer_type;
     // Repack buffer type(is_host=false), same mempool as buffer_type
@@ -328,6 +344,10 @@ struct ggml_backend_hexagon_context {
 
 struct hexagon_appcfg_t {
     int dump_debug_info;        // enable/disable dump debug info for troubleshooting issues on AP side
+    // MoE expert-trace (portage dspqueue bb586174) : 1 = émettre les événements
+    // `ggml-moe: expert-trace {...}` sur les MUL_MAT_ID (canal DEBUG).
+    int expert_trace;
+    std::string expert_trace_run_id;   // GGML_EXPERT_TRACE_RUN_ID (défaut "fastrpc")
     int thread_counts;          // thread_counts on HTP side
     int dump_diag_info;         // enable/disable dump diag info for troubleshooting issues on HTP side
     int ndev;                   // number of Hexagon devices (PDs), from GGML_HEXAGON_NDEV env
@@ -375,6 +395,8 @@ struct hexagon_appcfg_t {
 #endif
 static struct hexagon_appcfg_t g_hexagon_appcfg = {
         .dump_debug_info        = 0,
+        .expert_trace           = 0,
+        .expert_trace_run_id    = "fastrpc",
         .thread_counts          = 6,
         .dump_diag_info         = 0,
         .ndev                   = 1,
@@ -397,6 +419,17 @@ static struct hexagon_appcfg_t g_hexagon_appcfg = {
 #endif
         .version                = {"0.99.7.7"},
 };
+
+// P0-H: cross-TU accessor (tensor buffers in ggml-hexagon.cpp honor the same
+// extended-VA policy). Returns the appcfg values (defaults 0/0 until load_cfg).
+extern "C" void ggml_hexagon_get_rpc_mmap_cfg(int * out_extended, int * out_mmap_mode) {
+    if (out_extended) {
+        *out_extended = g_hexagon_appcfg.rpc_mmap_extended;
+    }
+    if (out_mmap_mode) {
+        *out_mmap_mode = g_hexagon_appcfg.rpc_mmap_mode;
+    }
+}
 
 //supported Snapdragon devices
 static struct qcom_socinfo g_hexagon_soc_info_table[] = {
@@ -670,6 +703,24 @@ static void ggmlhexagon_dump_perf_stats(const ggml_backend_hexagon_context * ctx
                                (unsigned long long)ctx->n_fused_ffn_cum, ffn_pct,
                                (unsigned long long)ctx->n_fused_mm_add_cum, add_pct);
     }
+
+    // [MMIDPROBE] MUL_MAT_ID routing summary (P0.1/P0.5, uncapped)
+    GGMLHEXAGON_LOG_VERBOSE("mmid route: sched_seen=%llu buft_rej=%llu no_validator=%llu generic_rej=%llu claimed=%llu "
+                            "type_rej=%llu prec_rej=%llu quant_rej=%llu layout_rej=%llu vtcm_rej=%llu validate_pass=%llu "
+                            "batch_seen=%llu hmx=%llu",
+                            (unsigned long long)ctx->n_mmid_seen_sched,
+                            (unsigned long long)ctx->n_mmid_reject_buft,
+                            (unsigned long long)ctx->n_mmid_reject_novalidator,
+                            (unsigned long long)ctx->n_mmid_reject_generic,
+                            (unsigned long long)ctx->n_mmid_claimed,
+                            (unsigned long long)ctx->n_mmid_reject_type,
+                            (unsigned long long)ctx->n_mmid_reject_prec,
+                            (unsigned long long)ctx->n_mmid_reject_quant,
+                            (unsigned long long)ctx->n_mmid_reject_layout,
+                            (unsigned long long)ctx->n_mmid_reject_vtcm,
+                            (unsigned long long)ctx->n_mmid_validate_pass,
+                            (unsigned long long)ctx->n_mmid_seen_batch,
+                            (unsigned long long)ctx->n_mmid_hmx);
 
     // HMX eligibility diagnostic: why MUL_MATs fall back to HVX
     {
@@ -954,6 +1005,20 @@ static void ggmlhexagon_load_cfg() {
             GGMLHEXAGON_LOG_WARN("invalid GGML_HEXAGON_MEMPOOL_MIB=%d, must be >=256; using cfg/default", v);
         }
     }
+    // MoE expert-trace (portage dspqueue bb586174) : GGML_EXPERT_TRACE=1 +
+    // GGML_EXPERT_TRACE_RUN_ID=<run> — même contrat JSON que la variante dspqueue.
+    const char * str_expert_trace = getenv("GGML_EXPERT_TRACE");
+    if (str_expert_trace) {
+        g_hexagon_appcfg.expert_trace = atoi(str_expert_trace) ? 1 : 0;
+    }
+    const char * str_expert_trace_run_id = getenv("GGML_EXPERT_TRACE_RUN_ID");
+    if (str_expert_trace_run_id && str_expert_trace_run_id[0]) {
+        g_hexagon_appcfg.expert_trace_run_id = str_expert_trace_run_id;
+    }
+    GGMLHEXAGON_LOG_ALWAYS("expert_trace=%d run_id=%s (env GGML_EXPERT_TRACE/GGML_EXPERT_TRACE_RUN_ID)",
+                           g_hexagon_appcfg.expert_trace,
+                           g_hexagon_appcfg.expert_trace_run_id.c_str());
+
     GGMLHEXAGON_LOG_ALWAYS("rpc_mmap_extended=%d, rpc_mempool_mib=%d (cfg; env GGML_HEXAGON_RPC_MMAP_EXTENDED/GGML_HEXAGON_MEMPOOL_MIB override)",
                            g_hexagon_appcfg.rpc_mmap_extended, g_hexagon_appcfg.rpc_mempool_mib);
 
@@ -1701,6 +1766,15 @@ static int ggmlhexagon_probe_dspinfo(ggml_backend_hexagon_context * ctx) {
     // HMX is present on V73+ (Snapdragon 8 Gen 2 and later); the NPU skel is built with -mhmx.
     if (!ctx->has_hmx && htp_arch >= V73) {
         ctx->has_hmx = true;
+    }
+    // [NHMX] Kill-switch HMX AP-side (parity upstream #29473 MM_SELECT/NHMX) —
+    // placed AFTER the fallback above, which re-enables HMX on devices where
+    // DSPRPC_GET_DSP_INFO under-reports hmx_depth (FIXME upstream). Forces
+    // every matmul (incl. MUL_MAT_ID) onto the HVX path. Diagnostic for the
+    // MMID hang — univariate A/B without touching thread counts.
+    if (getenv("GGML_HEXAGON_NHMX")) {
+        ctx->has_hmx = false;
+        GGMLHEXAGON_LOG_ALWAYS("NHMX=1: HMX disabled AP-side (diag kill-switch)");
     }
     GGMLHEXAGON_LOG_DEBUG("dsp arch version %d, vtcm_count %d, vtcm_page %d", htp_arch, vtcm_count, vtcm_page);
     //FIXME: hmx_depth/hmx_spatial report 0 via DSPRPC_GET_DSP_INFO on some devices
@@ -3983,6 +4057,73 @@ static bool hexagon_validate_mul_mat(ggml_backend_hexagon_context * ctx, const g
     return ggmlhexagon_supported_mul_mat(op, ctx);
 }
 
+// [MMIDPROBE] P0.3: dedicated MUL_MAT_ID validator — ports the invariants of
+// upstream ggml_hexagon_supported_mul_mat_id() (llama.cpp master, dspqueue
+// backend; see PR #29348 for the GGML_PREC_F32 rejection). Every rejection
+// reason is counted and logged (uncapped) so the admission path is provable.
+static bool hexagon_validate_mul_mat_id(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+    const ggml_tensor * src2 = op->src[2];
+    const ggml_tensor * dst  = op;
+
+    auto reject = [&](const char * reason, uint64_t * counter) {
+        (*counter)++;
+        GGMLHEXAGON_LOG_WARN("[mmidprobe] MMID reject reason=%s src0=%s ne=[%d,%d,%d,%d] src1=%s ne=[%d,%d,%d,%d] src2=%s ne=[%d,%d,%d,%d] dst=%s ne=[%d,%d,%d,%d]",
+                             reason,
+                             ggml_type_name(src0->type), (int)src0->ne[0], (int)src0->ne[1], (int)src0->ne[2], (int)src0->ne[3],
+                             src1 ? ggml_type_name(src1->type) : "null",
+                             src1 ? (int)src1->ne[0] : 0, src1 ? (int)src1->ne[1] : 0, src1 ? (int)src1->ne[2] : 0, src1 ? (int)src1->ne[3] : 0,
+                             src2 ? ggml_type_name(src2->type) : "null",
+                             src2 ? (int)src2->ne[0] : 0, src2 ? (int)src2->ne[1] : 0, src2 ? (int)src2->ne[2] : 0, src2 ? (int)src2->ne[3] : 0,
+                             ggml_type_name(dst->type), (int)dst->ne[0], (int)dst->ne[1], (int)dst->ne[2], (int)dst->ne[3]);
+        return false;
+    };
+
+    if (!src1 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !src2 || src2->type != GGML_TYPE_I32) {
+        return reject("type", &ctx->n_mmid_reject_type);
+    }
+    if (ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
+        return reject("prec", &ctx->n_mmid_reject_prec);
+    }
+    switch (src0->type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            if (!ggml_is_contiguous(src0) || ggml_is_permuted(src0)) {
+                return reject("layout_contig", &ctx->n_mmid_reject_layout);
+            }
+            if (src0->ne[0] % ((src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q4_K) ? QK_K : 32)) {
+                return reject("layout_align", &ctx->n_mmid_reject_layout);
+            }
+            break;
+        default:
+            return reject("quant", &ctx->n_mmid_reject_quant);
+    }
+
+    // VTCM / kernel support check via the local precompute (master uses
+    // ggml_hexagon_precompute_matmul_params + HTP_MM_KERNEL_UNSUPPORTED here).
+    hex_op_desc tmp_op;
+    memset(&tmp_op, 0, sizeof(tmp_op));
+    for (int k = 0; k < 4; k++) tmp_op.dst_idx[k] = -1;
+    for (int k = 0; k < 6; k++) tmp_op.src_idx[k] = -1;
+    tmp_op.opcode = GGML_OP_MUL_MAT_ID;
+    ggml_hexagon_precompute_mm_params(ctx, op, tmp_op, true);
+    const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) tmp_op.kernel_params;
+    const size_t vtcm_budget = (size_t)ctx->socinfo.vtcm_size_in_mb * 1024 * 1024;
+    if (kparams->kernel_type == HTP_MM_KERNEL_UNSUPPORTED || (size_t)kparams->vtcm_size > vtcm_budget) {
+        return reject("vtcm", &ctx->n_mmid_reject_vtcm);
+    }
+
+    ctx->n_mmid_validate_pass++;
+    return true;
+}
+
 static bool hexagon_validate_rms_norm(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
@@ -4407,6 +4548,15 @@ static void init_op_validators(void) {
     s_op_validators[GGML_OP_MUL]            = hexagon_validate_binary_op;
     s_op_validators[GGML_OP_DIV]            = hexagon_validate_binary_op;
     s_op_validators[GGML_OP_MUL_MAT]        = hexagon_validate_mul_mat;
+    // [MMIDPROBE] P0.3: dedicated MMID validator, env-gated so the same binary
+    // runs the pre-patch (off) and post-patch (on) sides of the A/B. Default
+    // OFF preserves the historical snapshot behavior (MMID unregistered).
+    {
+        const char * mme = getenv("GGML_HEXAGON_VALIDATE_MMID");
+        if (mme && atoi(mme)) {
+            s_op_validators[GGML_OP_MUL_MAT_ID] = hexagon_validate_mul_mat_id;
+        }
+    }
     s_op_validators[GGML_OP_RMS_NORM]       = hexagon_validate_rms_norm;
     s_op_validators[GGML_OP_NORM]           = hexagon_validate_norm_op;
     s_op_validators[GGML_OP_L2_NORM]        = hexagon_validate_norm_op;
@@ -4443,6 +4593,12 @@ static bool ggmlhexagon_can_handle_op_through_cdsp(ggml_backend_dev_t dev, const
         return true;
     }
 
+    // [MMIDPROBE] uncapped MUL_MAT_ID routing counters (P0.1)
+    const bool is_mmid = (op_tensor->op == GGML_OP_MUL_MAT_ID);
+    if (is_mmid) {
+        ((ggml_backend_hexagon_context *)dev->context)->n_mmid_seen_sched++;
+    }
+
     // [SCHEDPROBE] runtime op filter, mirrors GGML_HEXAGON_OPFILTER from the
     // sessions variant (ggml-hexagon.cpp) which is NOT compiled in mempool
     // builds. Lets the A/B matrix (FLASH_ATTN_EXT off / MUL_MAT off / ...) run
@@ -4469,6 +4625,9 @@ static bool ggmlhexagon_can_handle_op_through_cdsp(ggml_backend_dev_t dev, const
             GGMLHEXAGON_LOG_WARN("[schedprobe] '%s' op=%s REJECT-BUFT (dst+srcs must be hexagon/repack buft of this device)",
                                  op_tensor->name, ggml_op_desc(op_tensor));
         }
+        if (is_mmid) {
+            ((ggml_backend_hexagon_context *)dev->context)->n_mmid_reject_buft++;
+        }
         return false;
     }
 
@@ -4477,7 +4636,19 @@ static bool ggmlhexagon_can_handle_op_through_cdsp(ggml_backend_dev_t dev, const
     ggml_backend_hexagon_context * ctx = (ggml_backend_hexagon_context *)dev->context;
     hexagon_op_validator_t validator = s_op_validators[op_tensor->op];
     if (validator) {
-        return validator(ctx, op_tensor);
+        const bool ok = validator(ctx, op_tensor);
+        if (is_mmid) {
+            if (ok) {
+                ctx->n_mmid_claimed++;
+            } else {
+                ctx->n_mmid_reject_generic++;
+            }
+        }
+        return ok;
+    }
+    if (is_mmid) {
+        ctx->n_mmid_reject_novalidator++;
+        GGMLHEXAGON_LOG_WARN("[mmidprobe] MMID rejected: no validator registered (pre-P0.3 snapshot behavior)");
     }
     return false;
 }
@@ -5169,6 +5340,49 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
 
     // track per-graph node statistics (what ggml core assigned to this backend)
     ctx->total_nodes_processed += graph_n_nodes;
+
+    // ---- MoE expert-trace (portage du patch dspqueue bb586174) ----
+    // Émet les mêmes événements JSON `ggml-moe: expert-trace {...}` que la
+    // variante dspqueue, piloté par GGML_EXPERT_TRACE / GGML_EXPERT_TRACE_RUN_ID.
+    // Sans token_index par-token (pas d'état de décodage ici), la valeur 0
+    // est explicite dans le champ run_id pour le parseur côté harness.
+    if (g_hexagon_appcfg.expert_trace) {
+        // Itération directe de cgraph->nodes : disponible à CHAQUE appel
+        // (cache-hit ou miss), avec les ids du token courant. supported_nodes
+        // n'est rempli qu'en cache-miss et serait vide en décodage.
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            ggml_tensor * node = cgraph->nodes[i];
+            if (!node || node->op != GGML_OP_MUL_MAT_ID) {
+                continue;
+            }
+            const ggml_tensor * weights = node->src[0];
+            const ggml_tensor * ids     = node->src[2];
+            if (!weights || !ids || ids->type != GGML_TYPE_I32 || !ids->data
+                || ids->ne[1] != 1) {
+                continue;
+            }
+            int layer = -1;
+            if (sscanf(weights->name, "blk.%d.", &layer) != 1) {
+                continue;
+            }
+            const int32_t * expert_ids = static_cast<const int32_t *>(ids->data);
+            const size_t requested_bytes = weights->nb[2];
+            for (int64_t rank = 0; rank < ids->ne[0]; ++rank) {
+                // stderr direct (comme GGML_LOG_DEBUG côté dspqueue) : la
+                // capture harness lit le log bench (stdout/stderr redirigés),
+                // pas logcat ; et la macro DEBUG est vide en Release (NDEBUG).
+                fprintf(stderr,
+                    "ggml-moe: expert-trace {\"run_id\":\"%s\",\"token_index\":0,"
+                    "\"layer\":%d,\"expert_id\":%d,\"rank\":%lld,\"hit\":false,"
+                    "\"cache_tier\":\"none\",\"tensor_name\":\"%s\","
+                    "\"requested_bytes\":%zu,\"loaded_bytes\":%zu,"
+                    "\"htp_compute_us\":0}\n",
+                    g_hexagon_appcfg.expert_trace_run_id.c_str(), layer,
+                    expert_ids[rank], (long long) rank, weights->name,
+                    requested_bytes, requested_bytes);
+            }
+        }
+    }
     if (ctx->min_nodes_per_graph == 0 || graph_n_nodes < ctx->min_nodes_per_graph) {
         ctx->min_nodes_per_graph = graph_n_nodes;
     }
@@ -5288,6 +5502,17 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                 ctx->n_mul_mat_total_cum++;
                 if (((const struct htp_mm_kernel_params *) op.kernel_params)->n_hmx) {
                     ctx->n_hmx_used_cum++;
+                }
+            } else if (node->op == GGML_OP_MUL_MAT_ID) {
+                // [MMIDPROBE] P0.3 routing: precompute kernel params for the
+                // router op and force the direct HTP opcode (ggml_op_to_htp_op
+                // has no GGML_OP_MUL_MAT_ID case in this snapshot; the dspqueue
+                // backend resolves the equivalent mapping AP-side).
+                ggml_hexagon_precompute_mm_params(ctx, node, op, true);
+                op.htp_opcode = (int32_t) HTP_OP_MUL_MAT_ID;
+                ctx->n_mmid_seen_batch++;
+                if (((const struct htp_mm_kernel_params *) op.kernel_params)->n_hmx) {
+                    ctx->n_mmid_hmx++;
                 }
             } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
                 ggml_hexagon_compute_fa_params(ctx, node,

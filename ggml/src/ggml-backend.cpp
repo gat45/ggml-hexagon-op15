@@ -895,6 +895,17 @@ static bool ggml_sched_probe_active(void) {
     return ggml_sched_probe_enabled == 1;
 }
 
+// [SCHEDPROBE] uncapped aggregate counters: supports_op refusals are the exact
+// "why did this op not land on HTP" signal, but the first-40 line cap made
+// REJECT-OP counts unusable on MoE graphs. Aggregates are per op name and
+// unlimited; the human-readable lines stay capped.
+struct ggml_sched_probe_agg {
+    size_t n_accept     = 0;
+    size_t n_reject_op  = 0;
+    size_t n_no_backend = 0;
+};
+static std::map<std::string, ggml_sched_probe_agg> ggml_sched_probe_ops;
+
 static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, const struct ggml_tensor * tensor, const struct ggml_tensor * op) {
     ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     if (buffer == NULL) {
@@ -903,31 +914,45 @@ static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, co
 
     const bool probe = ggml_sched_probe_active();
     bool probe_logged[GGML_SCHED_MAX_BACKENDS] = { false };
+    std::string probe_op_desc;
+    if (probe) {
+        probe_op_desc = ggml_op_desc(op);
+    }
 
     // find highest prio backend that supports the buffer type and the op
     for (int i = 0; i < sched->n_backends; i++) {
         if (ggml_backend_supports_buft(sched->backends[i], buffer->buft) &&
             ggml_backend_supports_op(sched->backends[i], op)) {
-            if (probe && ggml_sched_probe_lines < GGML_SCHED_PROBE_MAX_LINES) {
-                ggml_sched_probe_lines++;
-                GGML_LOG_ERROR("[schedprobe] '%s' op=%s buft=%s -> backend[%d]=%s (accepted first match)\n",
-                    tensor->name, ggml_op_desc(op), ggml_backend_buft_name(buffer->buft),
-                    i, ggml_backend_name(sched->backends[i]));
+            if (probe) {
+                ggml_sched_probe_ops[probe_op_desc].n_accept++;
+                if (ggml_sched_probe_lines < GGML_SCHED_PROBE_MAX_LINES) {
+                    ggml_sched_probe_lines++;
+                    GGML_LOG_ERROR("[schedprobe] '%s' op=%s buft=%s -> backend[%d]=%s (accepted first match)\n",
+                        tensor->name, ggml_op_desc(op), ggml_backend_buft_name(buffer->buft),
+                        i, ggml_backend_name(sched->backends[i]));
+                }
             }
             return i;
         }
         if (probe) {
             const bool ok_buft = ggml_backend_supports_buft(sched->backends[i], buffer->buft);
             const bool ok_op   = ok_buft ? ggml_backend_supports_op(sched->backends[i], op) : false;
-            if (ok_buft && !ok_op && !probe_logged[i] && ggml_sched_probe_lines < GGML_SCHED_PROBE_MAX_LINES) {
-                // log once per backend per decision point: buft OK but op refused
-                probe_logged[i] = true;
-                ggml_sched_probe_lines++;
-                GGML_LOG_ERROR("[schedprobe] '%s' op=%s buft=%s -> backend[%d]=%s REJECT-OP (buft ok)\n",
-                    tensor->name, ggml_op_desc(op), ggml_backend_buft_name(buffer->buft),
-                    i, ggml_backend_name(sched->backends[i]));
+            if (ok_buft && !ok_op) {
+                ggml_sched_probe_ops[probe_op_desc].n_reject_op++;
+                if (!probe_logged[i] && ggml_sched_probe_lines < GGML_SCHED_PROBE_MAX_LINES) {
+                    // log once per backend per decision point: buft OK but op refused
+                    probe_logged[i] = true;
+                    ggml_sched_probe_lines++;
+                    GGML_LOG_ERROR("[schedprobe] '%s' op=%s buft=%s -> backend[%d]=%s REJECT-OP (buft ok)\n",
+                        tensor->name, ggml_op_desc(op), ggml_backend_buft_name(buffer->buft),
+                        i, ggml_backend_name(sched->backends[i]));
+                }
             }
         }
+    }
+
+    if (probe) {
+        ggml_sched_probe_ops[probe_op_desc].n_no_backend++;
     }
 
 #ifndef NDEBUG
@@ -1630,6 +1655,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         fprintf(stderr, "[schedprobe] graph: n_nodes=%d n_splits=%d copies_needed=%d n_backends=%d\n",
             graph->n_nodes, sched->n_splits, probe_total_inputs, sched->n_backends);
+        // [SCHEDPROBE] uncapped per-op aggregates (P0.1): full refusal accounting,
+        // not limited to the first 40 log lines.
+        if (!ggml_sched_probe_ops.empty()) {
+            fprintf(stderr, "[schedprobe] ops-aggregate: n_ops_tracked=%zu\n", ggml_sched_probe_ops.size());
+            for (const auto & kv : ggml_sched_probe_ops) {
+                fprintf(stderr, "[schedprobe] op-agg: op=%s accept=%zu reject_op=%zu no_backend=%zu\n",
+                    kv.first.c_str(), kv.second.n_accept, kv.second.n_reject_op, kv.second.n_no_backend);
+            }
+        }
         fflush(stderr);
     }
 

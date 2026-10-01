@@ -1279,6 +1279,12 @@ int ggml_htp_open(const char * uri, remote_handle64 * handle) {
     ctx->htp_ctx = (struct htp_context *)calloc(1, sizeof(struct htp_context));
     GGML_ASSERT(NULL != ctx->htp_ctx);
 
+    // NOTE: the DDR scratchpad for MUL_MAT_ID (ddr_spad_base/size) is NOT
+    // allocated here anymore. ggml_htp_setclocks re-initializes htp_context
+    // via memset on every call (root cause of the op_matmul_id+0x12C trap:
+    // state allocated in open() was silently destroyed). It is now owned by
+    // setclocks, which defines the htp_ctx working lifetime.
+
     // Allocate large per-session arrays from a single mempool.
     // pre_dt and pre_ht are [DSP_OPT_MAX_TENSORS]; prior_dst_ranges and
     // bulk_flush_ranges are [DSP_OPT_MAX_BATCH_DSTS].
@@ -1527,6 +1533,13 @@ int ggml_htp_close(remote_handle64 handle) {
     if (!ctx) return 0;
     g_dsp_ctx = ctx;
 
+    // Free the MUL_MAT_ID DDR scratchpad (allocated in ggml_htp_open).
+    if (ctx->htp_ctx && ctx->htp_ctx->ddr_spad_base) {
+        free(ctx->htp_ctx->ddr_spad_base);
+        ctx->htp_ctx->ddr_spad_base = NULL;
+        ctx->htp_ctx->ddr_spad_size = 0;
+    }
+
     // Cleanup htp_context resources (work_queue + dma queues).
     // New Qualcomm API (b2dd28a3b): *_queue_free() does not free the backing
     // buffer, so we track them in dsp_context and free them explicitly here.
@@ -1662,6 +1675,16 @@ AEEResult ggml_htp_setclocks(remote_handle64 handle, int32 diag_info, int32 requ
                 g_dsp_ctx->dma_queue_bufs[i] = NULL;
             }
         }
+        // MUL_MAT_ID DDR scratchpad (matrix_row_counts + matrix_rows): ownership
+        // lives HERE — setclocks defines the htp_ctx working lifetime and the
+        // memset below re-initializes htp_context on every call, so anything
+        // allocated in open() is silently destroyed (root cause of the
+        // op_matmul_id+0x12C trap, FastRPC 0x8000040d). Mirrors htp/main.c
+        // (dspqueue variant, 512 KB). Preserve the pointer across repeated
+        // setclocks calls; allocate on the first one.
+        uint8_t *    prev_spad = (uint8_t *) g_dsp_ctx->htp_ctx->ddr_spad_base;
+        const size_t spad_sz  = 512 * 1024;
+
         memset(g_dsp_ctx->htp_ctx, 0, sizeof(*g_dsp_ctx->htp_ctx));
         g_dsp_ctx->htp_ctx->vtcm_base      = (uint8_t *)g_dsp_ctx->vtcm_base;
         g_dsp_ctx->htp_ctx->vtcm_size      = g_dsp_ctx->vtcm_size;
@@ -1670,6 +1693,18 @@ AEEResult ggml_htp_setclocks(remote_handle64 handle, int32 diag_info, int32 requ
         g_dsp_ctx->htp_ctx->n_threads      = (uint32_t)g_dsp_ctx->thread_counts;
         g_dsp_ctx->htp_ctx->n_threads_div  = init_fastdiv_values((uint32_t)g_dsp_ctx->thread_counts);
         g_dsp_ctx->htp_ctx->hmx_enabled    = g_dsp_ctx->hmx_available ? true : false;
+
+        if (prev_spad) {
+            g_dsp_ctx->htp_ctx->ddr_spad_base = prev_spad;
+            g_dsp_ctx->htp_ctx->ddr_spad_size = spad_sz;
+        } else {
+            g_dsp_ctx->htp_ctx->ddr_spad_size = spad_sz;
+            g_dsp_ctx->htp_ctx->ddr_spad_base = memalign(128, spad_sz);
+            if (!g_dsp_ctx->htp_ctx->ddr_spad_base) {
+                GGMLHEXAGON_LOG_ERROR("ddr_spad memalign failed");
+                return AEE_ENOMEMORY;
+            }
+        }
 
         // work_queue: backing buffer holds worker stacks + queue struct.
         size_t wq_size  = work_queue_sizeof((uint32_t)g_dsp_ctx->thread_counts,
