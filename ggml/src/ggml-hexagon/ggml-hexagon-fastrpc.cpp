@@ -281,6 +281,8 @@ struct ggml_backend_hexagon_context {
     uint64_t n_mmid_validate_pass      = 0;  // dedicated validator passed
     uint64_t n_mmid_seen_batch         = 0;  // MMID nodes reaching batch descriptor build
     uint64_t n_mmid_hmx                = 0;  // MMID dispatched to HMX kernels
+    uint64_t n_mmid_nx_fused           = 0;  // MMID nodes folded into MUL_MAT_ID_NX groups
+    uint64_t n_mmid_nx_groups          = 0;  // MUL_MAT_ID_NX ops emitted
 
     // Buffer type owned by this context (each device has its own buft)
     struct ggml_backend_buffer_type buffer_type;
@@ -703,6 +705,11 @@ static void ggmlhexagon_dump_perf_stats(const ggml_backend_hexagon_context * ctx
                                (unsigned long long)ctx->n_fused_ffn_cum, ffn_pct,
                                (unsigned long long)ctx->n_fused_mm_add_cum, add_pct);
     }
+
+    // [MMIDPROBE] MUL_MAT_ID_NX fusion summary (opt-in GGML_HEXAGON_MMID_NX=1)
+    GGMLHEXAGON_LOG_VERBOSE("mmid nx: fused=%llu groups=%llu",
+                            (unsigned long long)ctx->n_mmid_nx_fused,
+                            (unsigned long long)ctx->n_mmid_nx_groups);
 
     // [MMIDPROBE] MUL_MAT_ID routing summary (P0.1/P0.5, uncapped)
     GGMLHEXAGON_LOG_VERBOSE("mmid route: sched_seen=%llu buft_rej=%llu no_validator=%llu generic_rej=%llu claimed=%llu "
@@ -5625,6 +5632,9 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         size_t n_mm_add_skip_vtcm         = 0;  // MUL_MAT+ADD candidate but VTCM budget exceeded
 
         const size_t vtcm_budget = ctx->socinfo.vtcm_size_in_mb * 1024 * 1024;
+        // NX fusion (MUL_MAT_ID_NX) is opt-in: GGML_HEXAGON_MMID_NX=1
+        const char * mmid_nx_env = getenv("GGML_HEXAGON_MMID_NX");
+        const bool mmid_nx_enabled = mmid_nx_env && mmid_nx_env[0] == '1';
         // QKV/FFN fusion prerequisites:
         //   - dispatches via NPU execute_op, which provides
         //     op_matmul_qkv / op_matmul_ffn as dedicated fused kernels (htp/matmul-ops.c).
@@ -5654,6 +5664,63 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                     n_rms_norm_mul++;
                     continue;
                 }
+            }
+
+            // MUL_MAT_ID + MUL_MAT_ID -> MUL_MAT_ID_NX (opt-in GGML_HEXAGON_MMID_NX=1).
+            // Fuses 2 consecutive expert-weight MMIDs (gate/up pair) sharing x + ids +
+            // weight geometry; the DSP kernel quantizes x ONCE for both (decode win).
+            // Wire layout: src_idx[6] => W0,W1,x,ids = 4 slots (N<=4 supported, N=2 emitted);
+            // dst_idx[4] holds the N outputs. Kernel whitelist per RAPPORT_NX_PORT_SCOPE:
+            // HMX -> HMX_2D, HVX -> QUANT_ROW/QUANT_BLOCK (FLAT and others refused).
+            if (mmid_nx_enabled && op.opcode == GGML_OP_MUL_MAT_ID && i + 1 < hex_ops.size()) {
+                const hex_op_desc & next = hex_ops[i + 1];
+                const ggml_tensor * n0   = (op.src_idx[0]   >= 0) ? tensor_src[op.src_idx[0]]   : nullptr;
+                const ggml_tensor * x0   = (op.src_idx[1]   >= 0) ? tensor_src[op.src_idx[1]]   : nullptr;
+                const ggml_tensor * ids0 = (op.src_idx[2]   >= 0) ? tensor_src[op.src_idx[2]]   : nullptr;
+                const ggml_tensor * d0   = (op.dst_idx[0]   >= 0) ? tensor_src[op.dst_idx[0]]   : nullptr;
+                const ggml_tensor * w1   = (next.src_idx[0] >= 0) ? tensor_src[next.src_idx[0]] : nullptr;
+                const ggml_tensor * x1   = (next.src_idx[1] >= 0) ? tensor_src[next.src_idx[1]] : nullptr;
+                const ggml_tensor * ids1 = (next.src_idx[2] >= 0) ? tensor_src[next.src_idx[2]] : nullptr;
+                const ggml_tensor * d1   = (next.dst_idx[0] >= 0) ? tensor_src[next.dst_idx[0]] : nullptr;
+
+                const bool mergeable = n0 && x0 && ids0 && d0 && w1 && x1 && ids1 && d1 &&
+                                 x1 == x0 && ids1 == ids0 &&
+                                 w1->type == n0->type &&
+                                 w1->ne[0] == n0->ne[0] && w1->ne[1] == n0->ne[1] && w1->ne[2] == n0->ne[2] &&
+                                 w1->nb[1] == n0->nb[1] && w1->nb[2] == n0->nb[2] &&
+                                 d1->ne[0] == d0->ne[0] && d1->ne[1] == d0->ne[1] &&
+                                 ids0->type == GGML_TYPE_I32 && ids0->nb[0] == sizeof(int32_t);
+                if (mergeable) {
+                    // Kernel support: the fused op reuses W0's kparams (same geometry as the
+                    // plain MMID; the DSP NX kernel derives its VTCM layout identically).
+                    const struct htp_mm_kernel_params * kp = (const struct htp_mm_kernel_params *) op.kernel_params;
+                    const bool kernel_ok = kp->kernel_type != HTP_MM_KERNEL_UNSUPPORTED &&
+                                     (kp->n_hmx
+                                        ? kp->kernel_type == HTP_MM_KERNEL_HMX_2D
+                                        : kp->kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW ||
+                                          kp->kernel_type == HTP_MM_KERNEL_HVX_QUANT_BLOCK);
+                    if (kernel_ok && (size_t) kp->vtcm_size <= vtcm_budget) {
+                        hex_op_desc nx = op;
+                        nx.htp_opcode = (int32_t) HTP_OP_MUL_MAT_ID_NX;
+                        // src[0]=W0 src[1]=W1 src[2]=x src[3]=ids ; dst[0]=d0 dst[1]=d1
+                        nx.src_idx[1] = next.src_idx[0];
+                        nx.src_idx[2] = op.src_idx[1];
+                        nx.src_idx[3] = op.src_idx[2];
+                        nx.src_idx[4] = -1;
+                        nx.src_idx[5] = -1;
+                        nx.dst_idx[1] = next.dst_idx[0];
+                        nx.dst_idx[2] = -1;
+                        nx.dst_idx[3] = -1;
+                        struct htp_mm_kernel_params * nkp = (struct htp_mm_kernel_params *) nx.kernel_params;
+                        nkp->n_weights = 2;
+                        fused_ops.push_back(nx);
+                        i++;
+                        ctx->n_mmid_nx_fused += 2;
+                        ctx->n_mmid_nx_groups++;
+                        continue;
+                    }
+                }
+                // not mergeable / kernel unsupported: fall through, op pushed unchanged
             }
 
             if (qkv_ffn_enabled && op.opcode == GGML_OP_MUL_MAT) {

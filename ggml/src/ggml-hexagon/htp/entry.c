@@ -741,6 +741,7 @@ static const htp_op_func_t g_op_dispatch[HTP_OP_INVALID] = {
     [HTP_OP_DIV]             = op_binary,
     [HTP_OP_MUL_MAT]         = op_matmul,
     [HTP_OP_MUL_MAT_ID]      = op_matmul_id,
+    [HTP_OP_MUL_MAT_ID_NX]   = op_matmul_id_nx,
     [HTP_OP_MUL_MAT_QKV]     = op_matmul_qkv,
     [HTP_OP_MUL_MAT_FFN]     = op_matmul_ffn,
     [HTP_OP_MUL_MAT_ADD]     = op_matmul,

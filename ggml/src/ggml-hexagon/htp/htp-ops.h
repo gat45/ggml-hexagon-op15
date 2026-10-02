@@ -58,6 +58,7 @@ enum htp_op_code {
     HTP_OP_DIV = 3,
     HTP_OP_MUL_MAT,
     HTP_OP_MUL_MAT_ID,
+    HTP_OP_MUL_MAT_ID_NX,
     HTP_OP_MUL_MAT_QKV,
     HTP_OP_MUL_MAT_FFN,
     HTP_OP_MUL_MAT_ADD,
@@ -104,7 +105,7 @@ enum htp_op_code {
 };
 
 #define HTP_OP_MAX_DIMS    4    // aka GGML_MAX_DIMS
-#define HTP_OP_MAX_INPUTS  6    // aka GGML_MAX_SRCS
+#define HTP_OP_MAX_INPUTS  6    // aka GGML_MAX_SRCS (MUL_MAT_ID_NX: N+2<=6 => N<=4 fused weights)
 #define HTP_OP_MAX_OUTPUTS 4
 #define HTP_OP_MAX_PARAMS  16   // aka GGML_MAX_OP_PARAMS
 #define HTP_OP_MAX_KERN_PARAMS 32

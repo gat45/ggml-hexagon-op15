@@ -64,6 +64,9 @@ typedef struct {
 struct htp_mm_context {
     const char * type;
     struct htp_ops_context * octx;
+    // MUL_MAT_ID_NX: activation tensor (src[n_weights]); NULL for plain MMID
+    // (quantizers then fall back to octx->src[1] as before).
+    const struct htp_tensor * act;
 
     void (*vec_dot_1x1)(const uint32_t n, float * restrict s0,
          const void * restrict vx0,
@@ -812,7 +815,7 @@ MATMUL_2D_REPACKED_IMPL(mxfp4_flat, 544,  flat_vec_dot_mxfp4_32x2,  flat_vec_dot
 static void name(unsigned int nth, unsigned int ith, void * data) {                                        \
     struct htp_mm_context * mmctx = data;                                                                  \
     struct htp_ops_context * octx = mmctx->octx;                                                           \
-    const struct htp_tensor * src = octx->src[1];                                                          \
+    const struct htp_tensor * src = mmctx->act ? mmctx->act : octx->src[1];                                \
     const uint32_t ne0 = src->ne[0];                                                                       \
     const uint32_t ne1 = src->ne[1];                                                                       \
     const uint32_t ne2 = src->ne[2];                                                                       \
@@ -854,7 +857,7 @@ static void quantize_f32_q8_0_tiled_block(unsigned int nth, unsigned int ith, vo
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
 
-    const struct htp_tensor * src = octx->src[1];
+    const struct htp_tensor * src = mmctx->act ? mmctx->act : octx->src[1];
 
     quantize_f32_q8_0_tiled_block_kernel(
         (const float *) src->data,
@@ -878,7 +881,7 @@ static void quantize_f32_q8_1_tiled_block(unsigned int nth, unsigned int ith, vo
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
 
-    const struct htp_tensor * src = octx->src[1];
+    const struct htp_tensor * src = mmctx->act ? mmctx->act : octx->src[1];
 
     quantize_f32_q8_1_tiled_block_kernel(
         (const float *) src->data,
@@ -3533,6 +3536,426 @@ static int hvx_mm_matmul_id(
     worker_pool_run_func(octx->ctx->worker_pool, hvx_mmid_task_func, mmctx, octx->n_threads);
 
     return HTP_STATUS_OK;
+}
+
+// ===========================================================================
+// MUL_MAT_ID_NX: fused multi-weight expert matmul (N MMIDs sharing the same
+// activation + expert ids). src[0..N-1]=W*, src[N]=act, src[N+1]=ids,
+// dsts[0..N-1]. The activation quantization + expert-id mapping is done ONCE
+// for all N weights (that is the win vs N plain MMID calls).
+// Port of upstream (dspqueue tree) op_matmul_id_nx / hmx_mm_op_matmul_id_nx /
+// hvx_mm_matmul_id_nx. Single-device tree: mdev partition omitted.
+// ===========================================================================
+
+static inline void scan_expert_ids(
+    const struct htp_tensor * ids,
+    uint32_t n_ids,
+    uint32_t n_as,
+    uint32_t * counts,
+    struct mmid_row_mapping * matrix_rows,
+    uint32_t mapping_stride
+);
+
+static int hmx_mm_op_matmul_id_nx(
+    struct htp_ops_context * octx,
+    struct htp_mm_context * mmctx
+) {
+    const uint32_t *                matrix_row_counts = mmctx->matrix_row_counts;
+    const struct mmid_row_mapping * matrix_rows       = mmctx->matrix_rows;
+    const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
+    const uint32_t n_weights = kparams->n_weights;
+    const struct htp_tensor * restrict src0 = octx->src[0];
+    const struct htp_tensor * restrict act  = octx->src[n_weights];
+    const int n_as = src0->ne[2];
+
+    for (uint32_t cur_a = 0; cur_a < (uint32_t) n_as; ++cur_a) {
+        const int32_t cne1 = matrix_row_counts[cur_a];
+        if (cne1 == 0) continue;
+
+        for (uint32_t p = 0; p < n_weights; ++p) {
+            const struct htp_tensor * restrict src_w = octx->src[p];
+            const struct htp_tensor * restrict dst   = octx->dsts[p];
+            if (!src_w || !dst) continue;
+
+            int ret = hmx_mm_id_2d_f32(octx->ctx, (float*) dst->data, (float*) act->data,
+                                       (const uint8_t *) src_w->data + cur_a * src_w->nb[2],
+                                       cne1, src_w->ne[0], src_w->ne[1],
+                                       act->ne[0],
+                                       act->ne[1],
+                                       act->nb[1], act->nb[2],
+                                       dst->nb[1], dst->nb[2],
+                                       (int) src_w->nb[1], (int) src_w->type,
+                                       matrix_rows, cur_a, mmctx->mapping_stride);
+            if (ret != 0) {
+                FARF(ERROR, "HMX matmul ID NX failed for expert %u weight %u, error %d\n", cur_a, p, ret);
+                return HTP_STATUS_NO_SUPPORT;
+            }
+        }
+    }
+
+    return HTP_STATUS_OK;
+}
+
+static void hvx_mm_id_nx(unsigned int nth, unsigned int ith, void * data) {
+    htp_matmul_preamble;
+
+    const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
+    const uint32_t n_weights                    = kparams->n_weights;
+    const struct htp_tensor * restrict act      = octx->src[n_weights];
+    const struct htp_tensor * restrict ids      = octx->src[n_weights + 1];
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+
+    const uint32_t n_prefetch = kparams->n_prefetch;
+    assert(n_prefetch >= 2 && n_prefetch <= HTP_MM_MAX_PREFETCH && (n_prefetch & (n_prefetch - 1)) == 0);
+
+    const uint32_t n_as = src0->ne[2];
+
+    const uint32_t *                matrix_row_counts = mmctx->matrix_row_counts;
+    const struct mmid_row_mapping * matrix_rows       = mmctx->matrix_rows;
+
+    const size_t src1_stride = mmctx->vtcm_src1_stride;
+
+    uint8_t * restrict vtcm_src0_ptr = mmctx->vtcm_src0 + mmctx->vtcm_src0_size_per_thread * ith;
+    uint8_t * restrict src1_data     = mmctx->vtcm_src1;
+
+    // Quantize the activation into vtcm_src1 (barrier-synced across threads).
+    // Without this the vec_dot reads uninitialized VTCM — deterministic garbage.
+    hvx_mm_run_quant_task(mmctx, ith);
+
+    for (uint32_t cur_a = 0; cur_a < n_as; ++cur_a) {
+        const int32_t cne1 = matrix_row_counts[cur_a];
+        if (cne1 == 0) continue;
+
+        for (uint32_t p = 0; p < n_weights; ++p) {
+            const struct htp_tensor * restrict src_w = octx->src[p];
+            const struct htp_tensor * restrict dst_p = octx->dsts[p];
+            if (!src_w || !dst_p) continue;
+
+            const uint32_t ne01_w = src_w->ne[1];
+            const uint32_t nrows  = ne01_w;
+            uint32_t src0_nrows_per_thread = (nrows + nth - 1) / nth;
+            src0_nrows_per_thread = hex_round_up(src0_nrows_per_thread, 32);
+
+            const uint32_t src0_start_row = src0_nrows_per_thread * ith;
+            const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, nrows);
+            if (src0_start_row >= src0_end_row) continue;
+
+            const uint8_t * src0_row = (const uint8_t *) src_w->data + cur_a * src_w->nb[2];
+
+            const uint32_t tile_size             = htp_mm_get_weight_tile_size(src_w->type);
+            const uint32_t aligned_tile_size     = htp_mm_get_weight_aligned_tile_size(src_w->type);
+            const uint32_t n_k_tiles_w           = src_w->ne[0] / 32;
+            const uint32_t n_k_tiles_a           = act->ne[0] / 32;
+            const uint32_t tile_row_stride       = n_k_tiles_w * tile_size;
+            const uint32_t tile_row_transfer_size_aligned = n_k_tiles_a * aligned_tile_size;
+
+            const uint32_t ct_start = src0_start_row / 32;
+            const uint32_t ct_end   = (src0_end_row + 31) / 32;
+
+            uint32_t push_ct = ct_start;
+            for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {
+                dma_queue_push(dma_queue, dma_make_ptr(vtcm_src0_ptr + d * tile_row_transfer_size_aligned, src0_row + push_ct * tile_row_stride),
+                               aligned_tile_size, tile_size, tile_size, n_k_tiles_a);
+            }
+
+            for (uint32_t ct = ct_start; ct < ct_end; ct++) {
+                const uint8_t * w_tile = (void *) dma_queue_pop(dma_queue).dst;
+
+                int valid_rows = (int)src_w->ne[1] - (int)(ct * 32);
+                valid_rows = MIN(32, MAX(0, valid_rows));
+
+                htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+                for (uint32_t cid = 0; cid < (uint32_t) cne1; ++cid) {
+                    struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, cid);
+                    const int rm1 = row_mapping.i1;  // expert idx
+                    const int rm2 = row_mapping.i2;  // token idx
+
+                    const uint32_t ir1 = fastmodulo(rm1, act->ne[1], &mmctx->mm_div_ne11);
+                    const uint8_t * restrict src1_col = (const uint8_t *) (src1_data + (ir1 + rm2 * act->ne[1]) * src1_stride);
+                    float * restrict dst_row = (float *) (dst_p->data + (rm1 * dst_p->nb[1] + rm2 * dst_p->nb[2]));
+
+                    mmctx->vec_dot_32x1(act->ne[0], &dst_row[ct * 32], w_tile, src1_col, valid_rows, NULL);
+                }
+                htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+
+                if (push_ct < ct_end) {
+                    dma_queue_push(dma_queue, dma_make_ptr((uint8_t *)w_tile, src0_row + push_ct * tile_row_stride),
+                                   aligned_tile_size, tile_size, tile_size, n_k_tiles_a);
+                    push_ct++;
+                }
+            }
+        }
+    }
+}
+
+static void hvx_mv_id_nx(unsigned int nth, unsigned int ith, void * data) {
+    htp_matmul_preamble;
+
+    const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
+    const uint32_t n_weights                    = kparams->n_weights;
+    const struct htp_tensor * restrict act      = octx->src[n_weights];
+    const struct htp_tensor * restrict ids      = octx->src[n_weights + 1];
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+
+    const uint32_t n_prefetch = kparams->n_prefetch;
+    assert(n_prefetch >= 2 && n_prefetch <= HTP_MM_MAX_PREFETCH && (n_prefetch & (n_prefetch - 1)) == 0);
+
+    const uint32_t n_aids = ids->ne[0];
+    const uint32_t n_ids  = src0->ne[2];
+
+    uint8_t * restrict vtcm_src0_ptr = mmctx->vtcm_src0 + mmctx->vtcm_src0_size_per_thread * ith;
+    uint8_t * restrict src1_data     = mmctx->vtcm_src1;
+
+    // Quantize the activation into vtcm_src1 (barrier-synced across threads).
+    // Without this the vec_dot reads uninitialized VTCM — deterministic garbage.
+    hvx_mm_run_quant_task(mmctx, ith);
+
+    for (uint32_t ie1 = 0; ie1 < n_aids; ++ie1) {
+        const int32_t eid = *(const int32_t *) ((const uint8_t *) ids->data + ie1 * ids->nb[0]);
+        if (eid < 0) continue;
+        assert(eid < (int32_t) n_ids);
+
+        for (uint32_t p = 0; p < n_weights; ++p) {
+            const struct htp_tensor * restrict src_w = octx->src[p];
+            const struct htp_tensor * restrict dst_p = octx->dsts[p];
+            if (!src_w || !dst_p) continue;
+
+            const uint32_t ne01_w = src_w->ne[1];
+            const uint32_t nrows  = ne01_w;
+            uint32_t src0_nrows_per_thread = (nrows + nth - 1) / nth;
+            src0_nrows_per_thread = hex_round_up(src0_nrows_per_thread, 32);
+
+            const uint32_t src0_start_row = src0_nrows_per_thread * ith;
+            const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, nrows);
+            if (src0_start_row >= src0_end_row) continue;
+
+            const uint8_t * src0_row = (const uint8_t *) src_w->data + eid * src_w->nb[2];
+            const uint8_t * restrict src1_col = (const uint8_t *) src1_data;
+            float * restrict dst_row = (float *) (dst_p->data + ie1 * dst_p->nb[1]);
+
+            const uint32_t tile_size             = htp_mm_get_weight_tile_size(src_w->type);
+            const uint32_t aligned_tile_size     = htp_mm_get_weight_aligned_tile_size(src_w->type);
+            const uint32_t n_k_tiles_w           = src_w->ne[0] / 32;
+            const uint32_t n_k_tiles_a           = act->ne[0] / 32;
+            const uint32_t tile_row_stride       = n_k_tiles_w * tile_size;
+            const uint32_t tile_row_transfer_size_aligned = n_k_tiles_a * aligned_tile_size;
+
+            const uint32_t ct_start = src0_start_row / 32;
+            const uint32_t ct_end   = (src0_end_row + 31) / 32;
+
+            uint32_t push_ct = ct_start;
+            for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {
+                dma_queue_push(dma_queue, dma_make_ptr(vtcm_src0_ptr + d * tile_row_transfer_size_aligned, src0_row + push_ct * tile_row_stride),
+                               aligned_tile_size, tile_size, tile_size, n_k_tiles_a);
+            }
+
+            for (uint32_t ct = ct_start; ct < ct_end; ct++) {
+                const uint8_t * w_tile = (void *) dma_queue_pop(dma_queue).dst;
+
+                int valid_rows = (int)src_w->ne[1] - (int)(ct * 32);
+                valid_rows = MIN(32, MAX(0, valid_rows));
+
+                htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+                mmctx->vec_dot_32x1(act->ne[0], &dst_row[ct * 32], w_tile, src1_col, valid_rows, NULL);
+                htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+
+                if (push_ct < ct_end) {
+                    dma_queue_push(dma_queue, dma_make_ptr((uint8_t *)w_tile, src0_row + push_ct * tile_row_stride),
+                                   aligned_tile_size, tile_size, tile_size, n_k_tiles_a);
+                    push_ct++;
+                }
+            }
+        }
+    }
+}
+
+static int hvx_mm_matmul_id_nx(
+    struct htp_ops_context * octx,
+    struct htp_mm_context * mmctx,
+    work_queue_func_t hvx_mmid_task_func
+) {
+    const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
+    const uint32_t n_weights                    = kparams->n_weights;
+    const struct htp_tensor * restrict src0     = octx->src[0];
+    const struct htp_tensor * restrict act      = octx->src[n_weights];
+    const struct htp_tensor * restrict ids      = octx->src[n_weights + 1];
+    const size_t src0_row_size = src0->nb[1];
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[0];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
+
+    const uint32_t act_nrows = act->ne[1] * act->ne[2] * act->ne[3];
+
+    const uint32_t qk = QK_Q8_0_TILED;
+    const uint32_t nb = (act->ne[0] + qk - 1) / qk;
+    const uint32_t total_nb = act_nrows * nb;
+
+    work_queue_func_t quant_task_func;
+    uint32_t n_quant_tasks = 1;
+    if (act_nrows < octx->n_threads) {
+        n_quant_tasks = MIN(total_nb, octx->n_threads);
+        quant_task_func = (src0->type == HTP_TYPE_Q4_1) ? quantize_f32_q8_1_tiled_block : quantize_f32_q8_0_tiled_block;
+        for (uint32_t ith = 0; ith < n_quant_tasks; ++ith) {
+            uint32_t ib_first = (total_nb * ith) / n_quant_tasks;
+            uint32_t ib_last  = (total_nb * (ith + 1)) / n_quant_tasks;
+            mmctx->quant_ib_first[ith] = ib_first;
+            mmctx->quant_ib_last[ith]  = ib_last;
+            mmctx->quant_r[ith]        = ib_first / nb;
+            mmctx->quant_c[ith]        = ib_first % nb;
+        }
+    } else {
+        n_quant_tasks = MIN(act_nrows, octx->n_threads);
+        quant_task_func = (src0->type == HTP_TYPE_Q4_1) ? quantize_f32_q8_1_tiled : quantize_f32_q8_0_tiled;
+    }
+    size_t src1_row_size = (src0->type == HTP_TYPE_Q4_1) ? htp_mm_q8_1_tiled_row_size(act->ne[0]) : htp_mm_q8_0_tiled_row_size(act->ne[0]);
+
+    struct htp_mm_hvx_vtcm_layout L;
+    htp_mm_hvx_vtcm_layout_build(&L, kparams->kernel_type, src0->type, act->ne[0], act_nrows, octx->n_threads,
+                                 0, src0_row_size, src1_row_size, 0, kparams->n_prefetch, true, false, false);
+
+    const size_t vtcm_size = L.total_bytes;
+
+    FARF(HIGH, "matmul-id-nx : src0-spad-size %zu src1-spad-size %zu src2-spad-size 0 dst-spad-size %zu (%zu)\n",
+         L.src0_bytes, L.src1_bytes, L.dst_bytes, vtcm_size);
+
+    FARF(HIGH, "matmul-id-nx : n_weights %u, act %ux%ux%ux%u -> %u dsts (vtcm %zu/%zu, threads %d)\n",
+         n_weights, act->ne[0], act->ne[1], act->ne[2], act->ne[3], n_weights,
+         L.total_bytes, octx->ctx->vtcm_size, octx->n_threads);
+
+    if (octx->ctx->vtcm_size < vtcm_size) {
+        FARF(ERROR, "matmul-id-nx: current VTCM reservation %zu is too small, needed %zu\n",
+             octx->ctx->vtcm_size, vtcm_size);
+        return HTP_STATUS_VTCM_TOO_SMALL;
+    }
+
+    uint8_t * const base = (uint8_t *) octx->ctx->vtcm_base;
+    mmctx->vtcm_src1 = VTCM_LAYOUT_PTR(uint8_t, base, L.off_src1);
+    mmctx->vtcm_src0 = VTCM_LAYOUT_PTR(uint8_t, base, L.off_src0);
+    mmctx->vtcm_src2 = NULL;
+    mmctx->vtcm_src3 = NULL;
+    mmctx->vtcm_dst  = VTCM_LAYOUT_PTR(uint8_t, base, L.off_dst);
+
+    octx->src1_spad.src  = NULL;
+    octx->src0_spad.src  = NULL;
+    octx->src2_spad.src  = NULL;
+    octx->src3_spad.src  = NULL;
+    octx->dst_spad.src   = NULL;
+
+    mmctx->vtcm_src0_stride = 0;
+    mmctx->vtcm_src1_stride = src1_row_size;
+
+    mmctx->vtcm_src0_size_per_thread = L.src0_bytes / octx->n_threads;
+    mmctx->vtcm_src1_size_per_thread = L.src1_bytes;
+    mmctx->vtcm_src2_size_per_thread = 0;
+    mmctx->vtcm_dst_size_per_thread  = L.dst_bytes / octx->n_threads;
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
+
+    mmctx->n_quant_rows_per_thread = (act_nrows + n_quant_tasks - 1) / n_quant_tasks;
+    mmctx->quant_task_func         = quant_task_func;
+    mmctx->n_quant_tasks           = n_quant_tasks;
+    atomic_init(&mmctx->quant_barrier, n_quant_tasks);
+
+    worker_pool_run_func(octx->ctx->worker_pool, hvx_mmid_task_func, mmctx, octx->n_threads);
+
+    return HTP_STATUS_OK;
+}
+
+int op_matmul_id_nx(struct htp_ops_context * octx) {
+    const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
+    struct htp_mm_context mmctx_struct = {0};
+    struct htp_mm_context * mmctx = &mmctx_struct;
+
+    mmctx->octx = octx;
+    const uint32_t n_weights = kparams->n_weights;
+    if (n_weights < 2) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+    const struct htp_tensor * restrict src0 = octx->src[0];
+    const struct htp_tensor * restrict act  = octx->src[n_weights];
+    const struct htp_tensor * restrict ids  = octx->src[n_weights + 1];
+    if (!src0 || !act || !ids) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+    // Quantizers read the activation through mmctx->act (NX) — src[1] would be W1 here.
+    mmctx->act = act;
+    for (uint32_t p = 0; p < n_weights; p++) {
+        if (!octx->dsts[p]) {
+            return HTP_STATUS_INVAL_PARAMS;
+        }
+    }
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[0];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
+
+    const size_t src0_row_size = src0->nb[1];
+    const size_t src0_row_size_padded = hex_round_up(src0_row_size, 128);
+
+    const uint32_t act_nrows = act->ne[1] * act->ne[2] * act->ne[3];
+
+    const int n_ids = ids->ne[0];
+    const int n_as  = src0->ne[2];
+
+    uint8_t  * mapping_buf       = octx->ctx->ddr_spad_base;
+    uint32_t   mapping_stride    = 1;
+    uint32_t * matrix_row_counts = (uint32_t *) mapping_buf;
+    struct mmid_row_mapping * matrix_rows = NULL;
+
+    if (act_nrows > 1) {
+        const size_t matrix_row_counts_size = n_as * sizeof(uint32_t);
+        assert(octx->ctx->ddr_spad_size >= matrix_row_counts_size);
+
+        hex_l2fetch_block((const void *) ids->data, ids->ne[1] * ids->nb[1]);
+
+        memset(matrix_row_counts, 0, matrix_row_counts_size);
+        scan_expert_ids(ids, n_ids, n_as, matrix_row_counts, NULL, 0);
+
+        uint32_t max_count = hvx_reduce_max_i32((const uint8_t *) matrix_row_counts, n_as);
+        mapping_stride = max_count > 0 ? max_count : 1;
+
+        size_t matrix_row_map_size  = n_as * mapping_stride * sizeof(struct mmid_row_mapping);
+        const size_t total_map_size = matrix_row_counts_size + matrix_row_map_size;
+
+        if (total_map_size > octx->ctx->ddr_spad_size) {
+            mapping_buf = memalign(128, total_map_size);
+            if (!mapping_buf) {
+                return HTP_STATUS_INTERNAL_ERR;
+            }
+        }
+
+        matrix_row_counts = (uint32_t *) mapping_buf;
+        matrix_rows       = (struct mmid_row_mapping *) (mapping_buf + matrix_row_counts_size);
+
+        memset(matrix_row_counts, 0, n_as * sizeof(uint32_t));
+        scan_expert_ids(ids, n_ids, n_as, matrix_row_counts, matrix_rows, mapping_stride);
+    }
+
+    mmctx->matrix_row_counts    = matrix_row_counts;
+    mmctx->matrix_rows          = matrix_rows;
+    mmctx->mapping_stride       = mapping_stride;
+    mmctx->mm_div_ne11          = kparams->div_ne11;
+    mmctx->src0_row_size_padded = src0_row_size_padded;
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
+
+    int s;
+    if (kparams->n_hmx) {
+        s = hmx_mm_op_matmul_id_nx(octx, mmctx);
+    } else {
+        if (hvx_mm_init_vec_dot(mmctx, src0->type) == 0) {
+            s = hvx_mm_matmul_id_nx(octx, mmctx, act_nrows > 1 ? hvx_mm_id_nx : hvx_mv_id_nx);
+        } else {
+            s = HTP_STATUS_NO_SUPPORT;
+        }
+    }
+
+    if (mapping_buf != octx->ctx->ddr_spad_base) {
+        free(mapping_buf);
+    }
+
+    return s;
 }
 
 static inline void scan_expert_ids_n(

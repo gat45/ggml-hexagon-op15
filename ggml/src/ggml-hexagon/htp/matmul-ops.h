@@ -78,6 +78,7 @@ struct htp_mm_kernel_params {
     int32_t  n_threads;          // Number of threads to spawn
     int32_t  n_act_threads;      // Number of threads for activation preparation
     int32_t  n_hmx;              // 1 = use HMX, 0 = use HVX
+    int32_t  n_weights;          // MUL_MAT_ID_NX: number of fused expert weights (1 = plain MMID)
     int32_t  n_prefetch;         // Prefetch lookahead buffers/rows in VTCM
     int32_t  tile_size;          // Weight tile size
     int32_t  aligned_tile_size;  // Aligned weight tile size (padded to 128)
