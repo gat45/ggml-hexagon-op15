@@ -3619,8 +3619,44 @@ static void hvx_mm_id_nx(unsigned int nth, unsigned int ith, void * data) {
     uint8_t * restrict vtcm_src0_ptr = mmctx->vtcm_src0 + mmctx->vtcm_src0_size_per_thread * ith;
     uint8_t * restrict src1_data     = mmctx->vtcm_src1;
 
-    // Quantize the activation into vtcm_src1 (barrier-synced across threads).
-    // Without this the vec_dot reads uninitialized VTCM — deterministic garbage.
+    // Overlap quant/DMA: queue the initial weight-tile prefetches of this
+    // thread's FIRST work unit BEFORE the quant barrier (same convention as
+    // hvx_mm_qkv_2d and the repacked workers), so the DMA engine transfers
+    // weights while threads quantize the activation into vtcm_src1 and spin
+    // at the barrier. The barrier itself must still complete before the first
+    // vec_dot — otherwise it reads uninitialized VTCM (deterministic garbage).
+    uint32_t pending_pre = 0;
+    for (uint32_t cur_a = 0; cur_a < n_as && pending_pre == 0; ++cur_a) {
+        if (matrix_row_counts[cur_a] == 0) continue;
+        for (uint32_t p = 0; p < n_weights; ++p) {
+            const struct htp_tensor * restrict src_w = octx->src[p];
+            if (!src_w || !octx->dsts[p]) continue;
+
+            const uint32_t nrows = src_w->ne[1];
+            uint32_t src0_nrows_per_thread = (nrows + nth - 1) / nth;
+            src0_nrows_per_thread = hex_round_up(src0_nrows_per_thread, 32);
+            const uint32_t s_row = src0_nrows_per_thread * ith;
+            const uint32_t e_row = MIN(s_row + src0_nrows_per_thread, nrows);
+            if (s_row >= e_row) continue;
+
+            const uint8_t * src0_row = (const uint8_t *) src_w->data + cur_a * src_w->nb[2];
+            const uint32_t tile_size             = htp_mm_get_weight_tile_size(src_w->type);
+            const uint32_t aligned_tile_size     = htp_mm_get_weight_aligned_tile_size(src_w->type);
+            const uint32_t n_k_tiles_a           = act->ne[0] / 32;
+            const uint32_t tile_row_stride       = (src_w->ne[0] / 32) * tile_size;
+            const uint32_t tile_row_transfer_size_aligned = n_k_tiles_a * aligned_tile_size;
+            const uint32_t ct_start = s_row / 32;
+            const uint32_t ct_end   = (e_row + 31) / 32;
+
+            for (uint32_t d = 0; d < n_prefetch && (ct_start + d) < ct_end; ++d) {
+                dma_queue_push(dma_queue, dma_make_ptr(vtcm_src0_ptr + d * tile_row_transfer_size_aligned, src0_row + (ct_start + d) * tile_row_stride),
+                               aligned_tile_size, tile_size, tile_size, n_k_tiles_a);
+            }
+            pending_pre = MIN(n_prefetch, ct_end - ct_start);
+            break;
+        }
+    }
+
     hvx_mm_run_quant_task(mmctx, ith);
 
     for (uint32_t cur_a = 0; cur_a < n_as; ++cur_a) {
@@ -3653,8 +3689,12 @@ static void hvx_mm_id_nx(unsigned int nth, unsigned int ith, void * data) {
             const uint32_t ct_start = src0_start_row / 32;
             const uint32_t ct_end   = (src0_end_row + 31) / 32;
 
-            uint32_t push_ct = ct_start;
-            for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {
+            // First work unit: the initial tiles were queued before the quant
+            // barrier — resume the prefetch at the pre-pushed depth.
+            uint32_t pre = pending_pre;
+            pending_pre = 0;
+            uint32_t push_ct = ct_start + pre;
+            for (uint32_t d = pre; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {
                 dma_queue_push(dma_queue, dma_make_ptr(vtcm_src0_ptr + d * tile_row_transfer_size_aligned, src0_row + push_ct * tile_row_stride),
                                aligned_tile_size, tile_size, tile_size, n_k_tiles_a);
             }
@@ -3708,8 +3748,45 @@ static void hvx_mv_id_nx(unsigned int nth, unsigned int ith, void * data) {
     uint8_t * restrict vtcm_src0_ptr = mmctx->vtcm_src0 + mmctx->vtcm_src0_size_per_thread * ith;
     uint8_t * restrict src1_data     = mmctx->vtcm_src1;
 
-    // Quantize the activation into vtcm_src1 (barrier-synced across threads).
-    // Without this the vec_dot reads uninitialized VTCM — deterministic garbage.
+    // Overlap quant/DMA: queue the initial weight-tile prefetches of this
+    // thread's FIRST work unit BEFORE the quant barrier (same convention as
+    // hvx_mm_qkv_2d and the repacked workers), so the DMA engine transfers
+    // weights while threads quantize the activation into vtcm_src1 and spin
+    // at the barrier. The barrier itself must still complete before the first
+    // vec_dot — otherwise it reads uninitialized VTCM (deterministic garbage).
+    uint32_t pending_pre = 0;
+    for (uint32_t ie1 = 0; ie1 < n_aids && pending_pre == 0; ++ie1) {
+        const int32_t eid = *(const int32_t *) ((const uint8_t *) ids->data + ie1 * ids->nb[0]);
+        if (eid < 0) continue;
+        for (uint32_t p = 0; p < n_weights; ++p) {
+            const struct htp_tensor * restrict src_w = octx->src[p];
+            if (!src_w || !octx->dsts[p]) continue;
+
+            const uint32_t nrows = src_w->ne[1];
+            uint32_t src0_nrows_per_thread = (nrows + nth - 1) / nth;
+            src0_nrows_per_thread = hex_round_up(src0_nrows_per_thread, 32);
+            const uint32_t s_row = src0_nrows_per_thread * ith;
+            const uint32_t e_row = MIN(s_row + src0_nrows_per_thread, nrows);
+            if (s_row >= e_row) continue;
+
+            const uint8_t * src0_row = (const uint8_t *) src_w->data + eid * src_w->nb[2];
+            const uint32_t tile_size             = htp_mm_get_weight_tile_size(src_w->type);
+            const uint32_t aligned_tile_size     = htp_mm_get_weight_aligned_tile_size(src_w->type);
+            const uint32_t n_k_tiles_a           = act->ne[0] / 32;
+            const uint32_t tile_row_stride       = (src_w->ne[0] / 32) * tile_size;
+            const uint32_t tile_row_transfer_size_aligned = n_k_tiles_a * aligned_tile_size;
+            const uint32_t ct_start = s_row / 32;
+            const uint32_t ct_end   = (e_row + 31) / 32;
+
+            for (uint32_t d = 0; d < n_prefetch && (ct_start + d) < ct_end; ++d) {
+                dma_queue_push(dma_queue, dma_make_ptr(vtcm_src0_ptr + d * tile_row_transfer_size_aligned, src0_row + (ct_start + d) * tile_row_stride),
+                               aligned_tile_size, tile_size, tile_size, n_k_tiles_a);
+            }
+            pending_pre = MIN(n_prefetch, ct_end - ct_start);
+            break;
+        }
+    }
+
     hvx_mm_run_quant_task(mmctx, ith);
 
     for (uint32_t ie1 = 0; ie1 < n_aids; ++ie1) {
@@ -3745,8 +3822,12 @@ static void hvx_mv_id_nx(unsigned int nth, unsigned int ith, void * data) {
             const uint32_t ct_start = src0_start_row / 32;
             const uint32_t ct_end   = (src0_end_row + 31) / 32;
 
-            uint32_t push_ct = ct_start;
-            for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {
+            // First work unit: the initial tiles were queued before the quant
+            // barrier — resume the prefetch at the pre-pushed depth.
+            uint32_t pre = pending_pre;
+            pending_pre = 0;
+            uint32_t push_ct = ct_start + pre;
+            for (uint32_t d = pre; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {
                 dma_queue_push(dma_queue, dma_make_ptr(vtcm_src0_ptr + d * tile_row_transfer_size_aligned, src0_row + push_ct * tile_row_stride),
                                aligned_tile_size, tile_size, tile_size, n_k_tiles_a);
             }
