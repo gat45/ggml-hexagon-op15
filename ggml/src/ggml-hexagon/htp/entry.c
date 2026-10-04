@@ -975,6 +975,7 @@ static void build_htp_octx(
     }
 
     octx->n_threads = (uint32_t)g_dsp_ctx->thread_counts;
+    octx->n_threads_div = init_fastdiv_values(octx->n_threads); // [b11272-port]
 }
 
 // Try HMX precompute (simple 2D path). Mirrors ggml_hexagon_precompute_hmx_mm_params

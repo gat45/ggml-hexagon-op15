@@ -66,6 +66,9 @@ struct htp_ops_context {
     struct htp_spad dst_spad;
 
     uint32_t n_threads;
+    // [b11272-port] fastdiv of n_threads, required by the concat b11272 port.
+    // Set wherever n_threads is assigned (entry.c / main.c).
+    struct fastdiv_values n_threads_div;
     uint32_t flags;
 };
 
@@ -78,6 +81,17 @@ struct htp_context {
     dma_queue_t            dma_cached[HTP_MAX_NTHREADS];
     work_queue_t           work_queue;
     hmx_queue_t            hmx_queue;
+
+    // [b11272-port] Single-device stand-in for upstream multi-device model
+    // split (eafe15a5e PR #28589). count <= 1 makes htp_tensor_mdev_partition()
+    // return the full range, so upstream multi-device call sites (concat b11272)
+    // stay inert on this single-NPU build. Zero-init is sufficient: every user
+    // only tests count > 1.
+    struct {
+        uint32_t              idx;
+        uint32_t              count;
+        struct fastdiv_values count_div;
+    } mdev;
 
     uint32_t               n_threads;
     struct fastdiv_values  n_threads_div;

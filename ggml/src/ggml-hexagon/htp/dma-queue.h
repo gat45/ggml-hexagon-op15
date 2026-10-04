@@ -147,6 +147,20 @@ static inline dma_ptr dma_make_ptr(void *dst, const void *src)
     return p;
 }
 
+// [b11272-port] Address-typed aliases mirroring the upstream dma-queue API
+// (0c3626ec0 64-bit-mapping overhaul). The concat b11272 port addresses DMA
+// endpoints numerically (concat_plane_addr); our descriptors carry plain
+// pointers, so numeric addresses simply cast back to pointers. Purely
+// additive: existing dma_make_ptr users are untouched.
+typedef uintptr_t dma_addr_t;
+
+static inline dma_ptr dma_make_data_impl(dma_addr_t dst, dma_addr_t src)
+{
+    return dma_make_ptr((void *) dst, (const void *) src);
+}
+
+#define dma_make_data(dst, src) dma_make_data_impl((dma_addr_t) (dst), (dma_addr_t) (src))
+
 static inline bool dma_is_vtcm(const dma_queue * q, const void * ptr) {
     return (uintptr_t) ptr >= q->ring->vtcm_base && (uintptr_t) ptr < q->ring->vtcm_end;
 }

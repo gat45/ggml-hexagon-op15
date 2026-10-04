@@ -1030,6 +1030,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     struct htp_ops_context *octx = &ctx->octx;
     memset(octx, 0, sizeof(*octx));
     octx->n_threads = ctx->n_threads;
+    octx->n_threads_div = ctx->n_threads_div; // [b11272-port]
     octx->ctx       = ctx;
 
     work_queue_wakeup(ctx->work_queue);
