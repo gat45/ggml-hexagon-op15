@@ -4380,6 +4380,18 @@ static bool hexagon_validate_argsort(ggml_backend_hexagon_context * ctx, const g
     GGML_UNUSED(ctx);
     if (op->src[0]->type != GGML_TYPE_F32)
         return false;
+    // Kernel limit: the fallback quicksort path crashes the PD on big rows with
+    // a STATE-DEPENDENT boundary — rig 2026-10-04: ne[0]=32768 passes in the
+    // full rig (warm session) but crashes the cDSP in a fresh-session filtered
+    // run (first 0x27 of that rig, everything downstream cascade-poisoned);
+    // ne[0]=65536 always crashes (first 0x27 of the full rigs). Rows up to
+    // 16384 pass consistently in every rig. spad need is ne00*8 bytes/thread
+    // (values f32 + indices i32) and the HTP_STATUS_VTCM_TOO_SMALL check does
+    // not catch this boundary. Reject >16384 so the op falls back to CPU
+    // honestly — same limit already used by the dspqueue variant
+    // (ggml_hexagon_supported_argsort, "reject tensors with huge rows for now").
+    if (op->src[0]->ne[0] > (16 * 1024))
+        return false;
     return true;
 }
 
