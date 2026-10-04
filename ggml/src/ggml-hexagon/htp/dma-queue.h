@@ -83,6 +83,14 @@ typedef struct {
     const void *src;
 } dma_ptr;
 
+// Hardware descriptor field limits (ported from upstream dcd387a41 #29685)
+#define DMA_MAX_NROWS          0xFFFFu        // 16-bit HW descriptor limit (65535)
+#define DMA_MAX_SIZE_16B       0xFFFFu        // 16-bit HW descriptor limit for row_size (65535)
+#define DMA_MAX_STRIDE_16B     0xFFFFu        // 16-bit HW descriptor limit for strides (65535)
+#define DMA_MAX_SIZE_24B       0x00FFFFFFu    // 24-bit HW descriptor limit for row_size / 1D size (16MB - 1)
+#define DMA_MAX_STRIDE_24B     0x00FFFFFFu    // 24-bit HW descriptor limit for strides (16MB - 1)
+#define DMA_SAFE_CHUNK_SIZE    0x00F00000u    // ~15MB safe contiguous chunk size
+
 typedef struct dma_ring_s dma_ring;
 struct dma_ring_s {
     dma_descriptor_2d * desc;      // descriptor pointers
