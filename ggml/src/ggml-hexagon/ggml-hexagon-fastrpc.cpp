@@ -4152,6 +4152,16 @@ static bool hexagon_validate_norm_op(ggml_backend_hexagon_context * ctx, const g
         return false;
     if (!ggml_is_contiguous(op))
         return false;
+    // op_unary reads src0 rows as ne0*ts contiguous bytes at stride nb[1] and
+    // never consults nb[0]: dim0 MUST be element-contiguous (same guard as
+    // hexagon_validate_unary's ggml_is_permuted check). A permuted view
+    // (ggml_permute(1,0,2,3) -> nb[0]=old nb[1] != ts) makes the kernel fetch
+    // the wrong addresses: structured wrong results AND a cDSP PD crash in
+    // op_unary (logcat "Process on cDSP0 CRASHED"), which kills the FastRPC
+    // session so every later 0xFFFC weight_inval reset fails with 0x27 and
+    // aborts all remaining batches (the "CONCAT 4D non-contig" rig cascade).
+    if (src0->nb[0] != ggml_type_size(src0->type))
+        return false;
     return true;
 }
 
@@ -4262,6 +4272,12 @@ static bool hexagon_validate_cpy(ggml_backend_hexagon_context * ctx, const ggml_
     if (src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_F32)
         return false;
     if (op->type != GGML_TYPE_F16 && op->type != GGML_TYPE_F32)
+        return false;
+    // Same-type strided-dim0 copies (permuted views) are handled correctly by
+    // the cpy kernel, but the mixed f16<->f32 conversion path assumes
+    // element-contiguous rows and silently miscomputes (ERR~2.0) on permuted
+    // sources. Reject that combination; the scheduler falls back to CPU.
+    if (src0->type != op->type && src0->nb[0] != ggml_type_size(src0->type))
         return false;
     return true;
 }
