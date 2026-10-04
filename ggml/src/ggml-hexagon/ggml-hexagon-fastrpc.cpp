@@ -4209,6 +4209,15 @@ static bool hexagon_validate_soft_max(ggml_backend_hexagon_context * ctx, const 
         return false;
     if (op->src[2] != nullptr)
         return false;
+    // Upstream port (ggml_hexagon_supported_softmax, kan/upstream):
+    // "Reject very large row sizes to avoid numerical precision issues —
+    // softmax accumulation over many elements can lead to precision loss"
+    // (SOFTMAX_MAX_ROW_SIZE = 128K). Rig 2026-10-04: ne0 in [.., 1024] and
+    // 1023 (non-32-aligned) pass, ne0 = 200000 / 643251 produce garbage
+    // (ERR ~ 1.0). Note: our kernel handles non-aligned 1023 correctly, so
+    // the upstream HVX-alignment guard is intentionally NOT ported.
+    if (src0->ne[0] > 131072)
+        return false;
     return true;
 }
 
