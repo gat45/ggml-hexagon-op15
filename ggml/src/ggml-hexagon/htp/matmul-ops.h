@@ -111,6 +111,14 @@ struct mmid_row_mapping {
     uint32_t i2;
 };
 
+// [NX-TOK2] opt-in flag (GGML_HEXAGON_MMID_NX_TOK2=1) carried in
+// htp_mm_kernel_params.pipeline bit 8: token-pair batching in hvx_mm_id_nx
+// (AMD #26349 heuristic — process ~2x the average tokens-per-expert per
+// weight-tile residency; halves VTCM weight reads, doubles HVX ILP for
+// experts with >= 2 tokens). Only set for HVX MMID kernels; HMX paths read
+// pipeline as a bool and never see the flag.
+#define HTP_MMID_NX_TOK2_FLAG 0x100
+
 // Search for optimal (mc, nc) chunk sizes within VTCM budget.
 static inline int htp_mm_hmx_compute_chunks(size_t   vtcm_total,
                               size_t   overhead,

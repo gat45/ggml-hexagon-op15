@@ -5635,6 +5635,12 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         // NX fusion (MUL_MAT_ID_NX) is opt-in: GGML_HEXAGON_MMID_NX=1
         const char * mmid_nx_env = getenv("GGML_HEXAGON_MMID_NX");
         const bool mmid_nx_enabled = mmid_nx_env && mmid_nx_env[0] == '1';
+        // [NX-TOK2] opt-in token-pair batching in the fused MMID_NX HVX kernel
+        // (AMD #26349 heuristic — ~2x average tokens-per-expert per weight-tile
+        // residency). Flag rides in kparams->pipeline bit 8, HVX kernels only
+        // (HMX paths read pipeline as a bool).
+        const char * mmid_nx_tok2_env = getenv("GGML_HEXAGON_MMID_NX_TOK2");
+        const bool mmid_nx_tok2 = mmid_nx_tok2_env && mmid_nx_tok2_env[0] == '1';
         // QKV/FFN fusion prerequisites:
         //   - dispatches via NPU execute_op, which provides
         //     op_matmul_qkv / op_matmul_ffn as dedicated fused kernels (htp/matmul-ops.c).
@@ -5713,6 +5719,10 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                         nx.dst_idx[3] = -1;
                         struct htp_mm_kernel_params * nkp = (struct htp_mm_kernel_params *) nx.kernel_params;
                         nkp->n_weights = 2;
+                        // [NX-TOK2] HVX only — HMX pipeline users only test != 0.
+                        if (!nkp->n_hmx && mmid_nx_tok2) {
+                            nkp->pipeline |= HTP_MMID_NX_TOK2_FLAG;
+                        }
                         fused_ops.push_back(nx);
                         i++;
                         ctx->n_mmid_nx_fused += 2;

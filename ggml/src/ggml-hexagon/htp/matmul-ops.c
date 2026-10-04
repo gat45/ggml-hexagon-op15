@@ -85,6 +85,14 @@ struct htp_mm_context {
          const void * restrict vy, uint32_t valid_rows,
          const float * restrict sz);
 
+    // [NX-TOK2] token-pair batching (opt-in, AMD #26349 heuristic): 32 weight
+    // rows x 2 tokens per call. Same activation layout as vec_dot_32x1
+    // (per-k-tile stride), sz0/sz1 optional (NULL = scales inline).
+    void (*vec_dot_32x2)(const uint32_t n, float * restrict s0, float * restrict s1,
+         const void * restrict vx,
+         const void * restrict vy0, const void * restrict vy1, uint32_t valid_rows,
+         const float * restrict sz0, const float * restrict sz1);
+
     // Precomputed values
     uint32_t src0_nrows_per_thread;
     uint32_t src0_row_size_padded;
@@ -1325,22 +1333,27 @@ static int hvx_mm_init_vec_dot(struct htp_mm_context * mmctx, enum htp_data_type
         case HTP_TYPE_Q4_0:
             mmctx->type         = "q4_0_tiled-f32";
             mmctx->vec_dot_32x1 = tiled_vec_dot_q4_0_32x1;
+            mmctx->vec_dot_32x2 = tiled_vec_dot_q4_0_32x2;
             return 0;
         case HTP_TYPE_Q4_1:
             mmctx->type         = "q4_1_tiled-f32";
             mmctx->vec_dot_32x1 = tiled_vec_dot_q4_1_32x1;
+            mmctx->vec_dot_32x2 = tiled_vec_dot_q4_1_32x2;
             return 0;
         case HTP_TYPE_Q8_0:
             mmctx->type         = "q8_0_tiled-f32";
             mmctx->vec_dot_32x1 = tiled_vec_dot_q8_0_32x1;
+            mmctx->vec_dot_32x2 = tiled_vec_dot_q8_0_32x2;
             return 0;
         case HTP_TYPE_IQ4_NL:
             mmctx->type         = "iq4nl_tiled-f32";
             mmctx->vec_dot_32x1 = tiled_vec_dot_iq4nl_32x1;
+            mmctx->vec_dot_32x2 = tiled_vec_dot_iq4nl_32x2;
             return 0;
         case HTP_TYPE_MXFP4:
             mmctx->type         = "mxfp4_tiled-f32";
             mmctx->vec_dot_32x1 = tiled_vec_dot_mxfp4_32x1;
+            mmctx->vec_dot_32x2 = tiled_vec_dot_mxfp4_32x2;
             return 0;
         default:
             return -1;
@@ -3619,6 +3632,10 @@ static void hvx_mm_id_nx(unsigned int nth, unsigned int ith, void * data) {
     uint8_t * restrict vtcm_src0_ptr = mmctx->vtcm_src0 + mmctx->vtcm_src0_size_per_thread * ith;
     uint8_t * restrict src1_data     = mmctx->vtcm_src1;
 
+    // [NX-TOK2] opt-in token-pair batching (AMD #26349 heuristic). Flag carried
+    // in kparams->pipeline bit 8 (set AP-side for HVX MMID kernels only).
+    const bool tok2 = (kparams->pipeline & HTP_MMID_NX_TOK2_FLAG) != 0 && mmctx->vec_dot_32x2;
+
     // Overlap quant/DMA: queue the initial weight-tile prefetches of this
     // thread's FIRST work unit BEFORE the quant barrier (same convention as
     // hvx_mm_qkv_2d and the repacked workers), so the DMA engine transfers
@@ -3706,16 +3723,48 @@ static void hvx_mm_id_nx(unsigned int nth, unsigned int ith, void * data) {
                 valid_rows = MIN(32, MAX(0, valid_rows));
 
                 htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
-                for (uint32_t cid = 0; cid < (uint32_t) cne1; ++cid) {
-                    struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, cid);
-                    const int rm1 = row_mapping.i1;  // expert idx
-                    const int rm2 = row_mapping.i2;  // token idx
+                if (tok2) {
+                    // [NX-TOK2] pair path: one w_tile residency per two tokens
+                    // (accumulation order differs from 32x1 — pairwise k-tile
+                    // sums — ULP-level only; validator + coherence gate it).
+                    uint32_t cid = 0;
+                    for (; cid + 1 < (uint32_t) cne1; cid += 2) {
+                        const struct mmid_row_mapping ra = MMID_MATRIX_ROW(cur_a, cid);
+                        const struct mmid_row_mapping rb = MMID_MATRIX_ROW(cur_a, cid + 1);
 
-                    const uint32_t ir1 = fastmodulo(rm1, act->ne[1], &mmctx->mm_div_ne11);
-                    const uint8_t * restrict src1_col = (const uint8_t *) (src1_data + (ir1 + rm2 * act->ne[1]) * src1_stride);
-                    float * restrict dst_row = (float *) (dst_p->data + (rm1 * dst_p->nb[1] + rm2 * dst_p->nb[2]));
+                        const uint32_t ir1a = fastmodulo(ra.i1, act->ne[1], &mmctx->mm_div_ne11);
+                        const uint32_t ir1b = fastmodulo(rb.i1, act->ne[1], &mmctx->mm_div_ne11);
+                        const uint8_t * restrict src1_col_a = (const uint8_t *) (src1_data + (ir1a + ra.i2 * act->ne[1]) * src1_stride);
+                        const uint8_t * restrict src1_col_b = (const uint8_t *) (src1_data + (ir1b + rb.i2 * act->ne[1]) * src1_stride);
+                        float * restrict dst_row_a = (float *) (dst_p->data + (ra.i1 * dst_p->nb[1] + ra.i2 * dst_p->nb[2]));
+                        float * restrict dst_row_b = (float *) (dst_p->data + (rb.i1 * dst_p->nb[1] + rb.i2 * dst_p->nb[2]));
 
-                    mmctx->vec_dot_32x1(act->ne[0], &dst_row[ct * 32], w_tile, src1_col, valid_rows, NULL);
+                        mmctx->vec_dot_32x2(act->ne[0], &dst_row_a[ct * 32], &dst_row_b[ct * 32], w_tile,
+                                            src1_col_a, src1_col_b, valid_rows, NULL, NULL);
+                    }
+                    for (; cid < (uint32_t) cne1; ++cid) {
+                        const struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, cid);
+                        const int rm1 = row_mapping.i1;
+                        const int rm2 = row_mapping.i2;
+
+                        const uint32_t ir1 = fastmodulo(rm1, act->ne[1], &mmctx->mm_div_ne11);
+                        const uint8_t * restrict src1_col = (const uint8_t *) (src1_data + (ir1 + rm2 * act->ne[1]) * src1_stride);
+                        float * restrict dst_row = (float *) (dst_p->data + (rm1 * dst_p->nb[1] + rm2 * dst_p->nb[2]));
+
+                        mmctx->vec_dot_32x1(act->ne[0], &dst_row[ct * 32], w_tile, src1_col, valid_rows, NULL);
+                    }
+                } else {
+                    for (uint32_t cid = 0; cid < (uint32_t) cne1; ++cid) {
+                        struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, cid);
+                        const int rm1 = row_mapping.i1;  // expert idx
+                        const int rm2 = row_mapping.i2;  // token idx
+
+                        const uint32_t ir1 = fastmodulo(rm1, act->ne[1], &mmctx->mm_div_ne11);
+                        const uint8_t * restrict src1_col = (const uint8_t *) (src1_data + (ir1 + rm2 * act->ne[1]) * src1_stride);
+                        float * restrict dst_row = (float *) (dst_p->data + (rm1 * dst_p->nb[1] + rm2 * dst_p->nb[2]));
+
+                        mmctx->vec_dot_32x1(act->ne[0], &dst_row[ct * 32], w_tile, src1_col, valid_rows, NULL);
+                    }
                 }
                 htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
 
