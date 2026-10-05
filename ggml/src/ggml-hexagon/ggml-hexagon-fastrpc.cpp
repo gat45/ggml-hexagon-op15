@@ -2835,6 +2835,7 @@ static bool ggml_hexagon_compute_fa_params(
     const ggml_tensor * k    = node->src[1];
     const ggml_tensor * v    = node->src[2];
     const ggml_tensor * mask = node->src[3];
+    const ggml_tensor * sinks = node->src[4];
     const ggml_tensor * dst  = node;
 
     const uint32_t DK = (uint32_t) q->ne[0];
@@ -2873,17 +2874,25 @@ static bool ggml_hexagon_compute_fa_params(
     bool hmx_eligible = false;
     if (ctx->has_hmx && ggml_hexagon_get_fa_select() >= 2 &&
         k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16) {
-        if (DK % 64 == 0 && DV % 64 == 0 && !(DK <= 128 && neq1 < 5)) {
+        // Head dims that are not multiples of 64 are handled by internally padding to
+        // DK_pad/DV_pad = round_up(.,64) and zero-filling the tail lanes.
+        if (DK % 8 == 0 && DV % 8 == 0 && !(DK <= 128 && neq1 < 5)) {
             hmx_eligible = true;
         }
     }
 
     if (hmx_eligible) {
+        // HMX tiles head_dim in units of 64; when DK/DV are not 64-aligned the kernel
+        // operates on padded dims with zero-filled tail lanes. VTCM budget and chunk-size
+        // are sized for the padded tiles.
+        const uint32_t DK_pad = hex_round_up(DK, 64);
+        const uint32_t DV_pad = hex_round_up(DV, 64);
         size_t Br = 0, Bc = 0;
         const size_t vtcm_budget = ctx->socinfo.vtcm_size_in_mb * 1024 * 1024;
-        int ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK, DV, neq1, nek1,
+        int ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK_pad, DV_pad, neq1, nek1,
                                          vtcm_budget, (size_t) ctx->n_threads,
-                                         kparams->is_q_fp32 != 0);
+                                         kparams->is_q_fp32 != 0,
+                                         sinks != nullptr, n_head);
         if (ret == 0) {
             kparams->kernel_type = HTP_FA_KERNEL_HMX;
             kparams->Br          = (uint16_t) Br;
@@ -2894,8 +2903,8 @@ static bool ggml_hexagon_compute_fa_params(
             kparams->u.hmx.g_br      = hex_align_up(G * Br, 32);
             kparams->u.hmx.pipeline  = (kparams->n_kv_blocks >= 3 && ctx->n_threads >= 2) ? 1 : 0;
             kparams->vtcm_size       = (uint32_t) hmx_fa_compute_vtcm_usage(
-                G, DK, DV, Br, Bc, kparams->n_threads, kparams->u.hmx.pipeline != 0,
-                kparams->is_q_fp32 != 0);
+                G, DK_pad, DV_pad, Br, Bc, kparams->n_threads, kparams->u.hmx.pipeline != 0,
+                kparams->is_q_fp32 != 0, sinks != nullptr, n_head);
 
             const size_t row_vec_bytes = hex_align_up(Bc * sizeof(uint16_t), 256);
             kparams->u.hmx.row_buf_stride = row_vec_bytes / 128;
@@ -2920,7 +2929,8 @@ static bool ggml_hexagon_compute_fa_params(
     kparams->n_kv_blocks    = (uint16_t)((k->ne[1] + 64 - 1) / 64);
     kparams->n_threads      = (uint8_t) ctx->n_threads;
     kparams->vtcm_size      = (uint32_t) hvx_fa_compute_vtcm_usage(
-        DK, DV, kparams->is_q_fp32 != 0, mask != nullptr, (size_t) ctx->n_threads);
+        DK, DV, kparams->is_q_fp32 != 0, mask != nullptr, sinks != nullptr, n_head,
+        (size_t) ctx->n_threads);
 
     kparams->u.hvx.size_q_row_padded = hex_round_up((uint32_t)(q->ne[0] * (kparams->is_q_fp32 ? 4 : 2)), 128);
     kparams->u.hvx.size_k_row_padded = hex_round_up((uint32_t)(k->ne[0] * 2), 128);
