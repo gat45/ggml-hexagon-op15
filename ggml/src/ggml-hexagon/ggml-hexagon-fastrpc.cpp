@@ -4454,14 +4454,18 @@ static bool hexagon_validate_diag(ggml_backend_hexagon_context * ctx, const ggml
 }
 
 static bool hexagon_validate_argsort(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
-    // [kan-port argsort-chunked 2026-10-05] Replaces the ne00<=16K cap of the
-    // single-row-per-thread kernel (whose fallback quicksort crashed the PD on
-    // big rows with a state-dependent boundary: rig 2026-10-04 ne[0]=65536
-    // always, 32768 fresh-session, <=16384 stable). Accept a row only if the
-    // chunked VTCM layout of the ported kernel (argsort-ops.h
-    // htp_sort_solve_layout) fits the SoC VTCM budget. Huge rows (>=32K) now
-    // sort on-device via parallel chunks + merge instead of crashing or
-    // falling back to CPU.
+    // [2026-10-05] ARGSORT fully disabled on the AP: the chunked kernel
+    // (6ea37e0fe) leaves residual state that degrades with session history —
+    // rig pass 2 poisoned at 65536, pass 4 (cap 16384) poisoned at 16383 on
+    // the SECOND argsort pass (fresh pass OK), each time wedging the DSP
+    // session (0x27 storm, whole downstream FA section corrupted). Even the
+    // old kernel's "<=16384 stable" boundary is not reproduced by the chunked
+    // port. Rejecting here = CPU for every argsort (NOTSUP in the rig, no
+    // poison). Re-enable after a stateful targeted rig finds the leak
+    // (VTCM/scratch reuse across ops?) — fresh-session rigs (74/74, 80/80)
+    // provably hide this bug.
+    (void) ctx; (void) op;
+    return false;
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * dst  = op;
 
