@@ -176,6 +176,7 @@ static const char * htp_op_short_name(unsigned int op) {
         case HTP_OP_CPY:             return "CPY";
         case HTP_OP_REPEAT:          return "REPEAT";
         case HTP_OP_ARGSORT:         return "ARGSORT";
+        case HTP_OP_TOP_K:           return "TOP_K";
         case HTP_OP_SSM_CONV:        return "SSM_CONV";
         case HTP_OP_CUMSUM:          return "CUMSUM";
         case HTP_OP_FILL:            return "FILL";
@@ -772,6 +773,7 @@ static const htp_op_func_t g_op_dispatch[HTP_OP_INVALID] = {
     [HTP_OP_CPY]             = op_cpy,
     [HTP_OP_REPEAT]          = op_repeat,
     [HTP_OP_ARGSORT]         = op_argsort,
+    [HTP_OP_TOP_K]           = op_top_k,
     [HTP_OP_SSM_CONV]        = op_ssm_conv,
     [HTP_OP_CUMSUM]          = op_cumsum,
     [HTP_OP_FILL]            = op_fill,
@@ -888,6 +890,7 @@ static int ggml_op_to_htp_op(int32_t ggml_op, const int32_t * op_params,
         case GGML_OP_SQR:     *htp_op = HTP_OP_SQR;         return 0;
         case GGML_OP_SQRT:    *htp_op = HTP_OP_SQRT;        return 0;
         case GGML_OP_ARGSORT: *htp_op = HTP_OP_ARGSORT;     return 0;
+        case GGML_OP_TOP_K:   *htp_op = HTP_OP_TOP_K;       return 0;
         case GGML_OP_PAD:     *htp_op = HTP_OP_PAD;         return 0;
         case GGML_OP_IM2COL:  *htp_op = HTP_OP_IM2COL;      return 0;
         case GGML_OP_GATED_DELTA_NET: *htp_op = HTP_OP_GATED_DELTA_NET; return 0;

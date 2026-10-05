@@ -71,6 +71,7 @@
 #include "htp/matmul-ops.h"
 #include "htp/flash-attn-ops.h"
 #include "htp/unary-ops.h"
+#include "htp/argsort-ops.h"
 
 // =================================================================================================
 //  section-1: forward declarations, global vars, macros
@@ -2972,6 +2973,63 @@ static bool ggml_op_to_htp_op_unary(int32_t ggml_op, const int32_t * op_params, 
 
 // Precompute htp_unary_kernel_params on AP side for unary ops (NORM, RMS_NORM,
 // RMS_NORM_MUL, SCALE, SQR, SQRT, UNARY_*, L2_NORM, TRI).
+// [kan-port argsort-chunked 2026-10-05] Precompute htp_sort_kernel_params on AP
+// side for ARGSORT / TOP_K (kan fastrpc ggml_hexagon_precompute_sort_params,
+// mirrors ggml-hexagon.cpp of the dspqueue variant). Layout is solved with the
+// same htp_sort_solve_layout the validators used, so ok is guaranteed here; on
+// a hypothetical failure leave n_threads=0 and the DSP re-solves (and cleanly
+// rejects with VTCM_TOO_SMALL) instead of aborting.
+static void ggml_hexagon_precompute_sort_params(
+    const ggml_backend_hexagon_context * ctx,
+    const ggml_tensor * node,
+    bool is_top_k,
+    struct htp_sort_kernel_params * kparams
+) {
+    memset(kparams, 0, sizeof(*kparams));
+
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * dst  = node;
+
+    const uint32_t total_rows = (uint32_t)(src0->ne[1] * src0->ne[2] * src0->ne[3]);
+    const uint32_t ne00       = (uint32_t) src0->ne[0];
+    const uint32_t k          = (uint32_t) dst->ne[0];
+
+    int32_t order = GGML_SORT_ORDER_DESC;
+    if (!is_top_k) {
+        order = ((const int32_t *) node->op_params)[0];
+    }
+
+    const uint32_t n_threads_max = ctx->n_threads > 0 ? (uint32_t) ctx->n_threads : 4;
+    const size_t vtcm_budget = ctx->socinfo.vtcm_size_in_mb > 0
+        ? ((size_t) ctx->socinfo.vtcm_size_in_mb * 1024 * 1024)
+        : (8 * 1024 * 1024);
+
+    struct htp_sort_vtcm_layout layout;
+    if (!htp_sort_solve_layout(&layout, ne00, total_rows, k, n_threads_max, vtcm_budget, is_top_k)) {
+        GGMLHEXAGON_LOG_WARN("sort layout solve failed ne00=%u rows=%u k=%u; params left unsolved",
+                             ne00, total_rows, k);
+        return;
+    }
+
+    kparams->n_threads         = (int32_t) layout.n_threads;
+    kparams->total_rows        = (int32_t) total_rows;
+    kparams->row_start         = 0;
+    kparams->row_end           = (int32_t) total_rows;
+    kparams->ne00              = (int32_t) ne00;
+    kparams->k                 = (int32_t) k;
+    kparams->order             = order;
+    kparams->is_top_k          = is_top_k ? 1 : 0;
+    kparams->use_dma           = 1;
+    kparams->chunk_elems       = (int32_t) layout.chunk_elems;
+    kparams->n_chunks          = (int32_t) layout.n_chunks;
+    kparams->vtcm_size         = (int32_t) layout.total_bytes;
+    kparams->phase1_slot_size  = (int32_t) layout.phase1_slot_size;
+    kparams->merge_values_off  = (int32_t) layout.merge_values_off;
+    kparams->merge_indices_off = (int32_t) layout.merge_indices_off;
+    kparams->merge_elems       = (int32_t) layout.merge_elems;
+    kparams->n_slots           = (int32_t) layout.n_slots;
+}
+
 static void ggml_hexagon_precompute_unary_params(
     const ggml_backend_hexagon_context * ctx,
     uint32_t op,
@@ -4386,21 +4444,58 @@ static bool hexagon_validate_diag(ggml_backend_hexagon_context * ctx, const ggml
 }
 
 static bool hexagon_validate_argsort(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
-    GGML_UNUSED(ctx);
-    if (op->src[0]->type != GGML_TYPE_F32)
+    // [kan-port argsort-chunked 2026-10-05] Replaces the ne00<=16K cap of the
+    // single-row-per-thread kernel (whose fallback quicksort crashed the PD on
+    // big rows with a state-dependent boundary: rig 2026-10-04 ne[0]=65536
+    // always, 32768 fresh-session, <=16384 stable). Accept a row only if the
+    // chunked VTCM layout of the ported kernel (argsort-ops.h
+    // htp_sort_solve_layout) fits the SoC VTCM budget. Huge rows (>=32K) now
+    // sort on-device via parallel chunks + merge instead of crashing or
+    // falling back to CPU.
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * dst  = op;
+
+    if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_I32) {
         return false;
-    // Kernel limit: the fallback quicksort path crashes the PD on big rows with
-    // a STATE-DEPENDENT boundary — rig 2026-10-04: ne[0]=32768 passes in the
-    // full rig (warm session) but crashes the cDSP in a fresh-session filtered
-    // run (first 0x27 of that rig, everything downstream cascade-poisoned);
-    // ne[0]=65536 always crashes (first 0x27 of the full rigs). Rows up to
-    // 16384 pass consistently in every rig. spad need is ne00*8 bytes/thread
-    // (values f32 + indices i32) and the HTP_STATUS_VTCM_TOO_SMALL check does
-    // not catch this boundary. Reject >16384 so the op falls back to CPU
-    // honestly — same limit already used by the dspqueue variant
-    // (ggml_hexagon_supported_argsort, "reject tensors with huge rows for now").
-    if (op->src[0]->ne[0] > (16 * 1024))
+    }
+
+    const uint32_t total_rows = (uint32_t)(src0->ne[1] * src0->ne[2] * src0->ne[3]);
+    const uint32_t n_threads_max = ctx->n_threads > 0 ? (uint32_t) ctx->n_threads : 4;
+    const size_t vtcm_budget = ctx->socinfo.vtcm_size_in_mb > 0
+        ? ((size_t) ctx->socinfo.vtcm_size_in_mb * 1024 * 1024)
+        : (8 * 1024 * 1024);
+
+    struct htp_sort_vtcm_layout layout;
+    if (!htp_sort_solve_layout(&layout, (uint32_t) src0->ne[0], total_rows,
+                               (uint32_t) dst->ne[0], n_threads_max, vtcm_budget, false)) {
         return false;
+    }
+
+    return true;
+}
+
+static bool hexagon_validate_top_k(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+    // [kan-port] TOP_K shares the chunked sort kernel; validator mirrors argsort
+    // with is_top_k=true (kan fastrpc hexagon_validate_top_k).
+    const ggml_tensor * src0 = op->src[0]; // values
+    const ggml_tensor * dst  = op;         // indices
+
+    if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_I32) {
+        return false;
+    }
+
+    const uint32_t total_rows = (uint32_t)(src0->ne[1] * src0->ne[2] * src0->ne[3]);
+    const uint32_t n_threads_max = ctx->n_threads > 0 ? (uint32_t) ctx->n_threads : 4;
+    const size_t vtcm_budget = ctx->socinfo.vtcm_size_in_mb > 0
+        ? ((size_t) ctx->socinfo.vtcm_size_in_mb * 1024 * 1024)
+        : (8 * 1024 * 1024);
+
+    struct htp_sort_vtcm_layout layout;
+    if (!htp_sort_solve_layout(&layout, (uint32_t) src0->ne[0], total_rows,
+                               (uint32_t) dst->ne[0], n_threads_max, vtcm_budget, true)) {
+        return false;
+    }
+
     return true;
 }
 
@@ -4623,6 +4718,7 @@ static void init_op_validators(void) {
     s_op_validators[GGML_OP_CUMSUM]         = hexagon_validate_cumsum;
     s_op_validators[GGML_OP_DIAG]           = hexagon_validate_diag;
     s_op_validators[GGML_OP_ARGSORT]        = hexagon_validate_argsort;
+    s_op_validators[GGML_OP_TOP_K]          = hexagon_validate_top_k;
     s_op_validators[GGML_OP_PAD]            = hexagon_validate_pad;
     s_op_validators[GGML_OP_IM2COL]         = hexagon_validate_im2col;
     s_op_validators[GGML_OP_GATED_DELTA_NET]= hexagon_validate_gated_delta_net;
@@ -5561,6 +5657,14 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
             } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
                 ggml_hexagon_compute_fa_params(ctx, node,
                     (struct htp_fa_kernel_params *) op.kernel_params);
+            } else if (node->op == GGML_OP_ARGSORT || node->op == GGML_OP_TOP_K) {
+                // [kan-port argsort-chunked] AP-precomputed chunked sort layout
+                // (kan fastrpc Phase 2 schema); explicit opcode so the DSP does
+                // not re-derive it and lands on op_argsort/op_top_k directly.
+                ggml_hexagon_precompute_sort_params(ctx, node,
+                    node->op == GGML_OP_TOP_K,
+                    (struct htp_sort_kernel_params *) op.kernel_params);
+                op.htp_opcode = (node->op == GGML_OP_TOP_K) ? (int32_t) HTP_OP_TOP_K : (int32_t) HTP_OP_ARGSORT;
             } else {
                 // Unary-family ops (NORM, RMS_NORM, SCALE, SQR, SQRT, UNARY_*,
                 // L2_NORM, TRI) require host-precomputed htp_unary_kernel_params

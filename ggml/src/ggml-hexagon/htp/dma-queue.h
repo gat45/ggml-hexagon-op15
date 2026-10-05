@@ -422,6 +422,24 @@ static inline bool dma_cache_push(dma_queue *q, dma_cache *c, const uint8_t * sr
     return dma_queue_push_single_1d(q, dma_make_ptr(dst, src), 0);
 }
 
+// [kan-port argsort-chunked 2026-10-05] Synchronous single-transfer helpers
+// (kan ab9acc44 dma-queue.h): push + pop in one call for simple DDR<->VTCM moves.
+static inline void dma_sync_read(dma_queue * dma_q, void * dst, dma_addr_t src, size_t bytes) {
+    const uint32_t b = (uint32_t) bytes;
+    if (b > 0) {
+        dma_queue_push(dma_q, dma_make_data(dst, src), b, b, b, 1);
+        dma_queue_pop(dma_q);
+    }
+}
+
+static inline void dma_sync_write(dma_queue * dma_q, dma_addr_t dst, const void * src, size_t bytes) {
+    const uint32_t b = (uint32_t) bytes;
+    if (b > 0) {
+        dma_queue_push(dma_q, dma_make_data(dst, src), b, b, b, 1);
+        dma_queue_pop(dma_q);
+    }
+}
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif
