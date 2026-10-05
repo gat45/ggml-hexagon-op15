@@ -4469,6 +4469,18 @@ static bool hexagon_validate_argsort(ggml_backend_hexagon_context * ctx, const g
         return false;
     }
 
+    // [2026-10-05 TEMP GUARD v2] rig_fasinks2/3: the chunked kernel is
+    // STATE-DEPENDENT on large rows — 65535 sorts OK on a fresh session but
+    // FAILs (ERR ~0.99995) on the rig's second pass and poisons the DSP
+    // session (0x27 x2689, whole FA section corrupted). Same pattern as the
+    // old kernel's "65536 always, 32768 fresh-session, <=16384 stable".
+    // Cap back to the historically stable 16384 until the cross-session
+    // state leak (chunked merge) is fixed; rows >16384 fall back to CPU
+    // exactly like the pre-port baseline (rig_g16k_full reference parity).
+    if (src0->ne[0] > 16384) {
+        return false;
+    }
+
     const uint32_t total_rows = (uint32_t)(src0->ne[1] * src0->ne[2] * src0->ne[3]);
     const uint32_t n_threads_max = ctx->n_threads > 0 ? (uint32_t) ctx->n_threads : 4;
     const size_t vtcm_budget = ctx->socinfo.vtcm_size_in_mb > 0
