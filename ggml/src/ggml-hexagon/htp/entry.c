@@ -890,7 +890,11 @@ static int ggml_op_to_htp_op(int32_t ggml_op, const int32_t * op_params,
         case GGML_OP_SQR:     *htp_op = HTP_OP_SQR;         return 0;
         case GGML_OP_SQRT:    *htp_op = HTP_OP_SQRT;        return 0;
         case GGML_OP_ARGSORT: *htp_op = HTP_OP_ARGSORT;     return 0;
-        case GGML_OP_TOP_K:   *htp_op = HTP_OP_TOP_K;       return 0;
+        // [2026-10-05] TOP_K disabled: op_top_k k=1 DMA scan path SIGSEGVs the
+        // AP (test-backend-ops RC=139, rig_fix_topk) — port 6ea37e0fe not ready.
+        // Falls back to CPU until fixed. Re-enable with GGML_OP_TOP_K mapping
+        // once the argmax scan + merge_runs bugs are fixed and rig-validated.
+        // case GGML_OP_TOP_K:   *htp_op = HTP_OP_TOP_K;       return 0;
         case GGML_OP_PAD:     *htp_op = HTP_OP_PAD;         return 0;
         case GGML_OP_IM2COL:  *htp_op = HTP_OP_IM2COL;      return 0;
         case GGML_OP_GATED_DELTA_NET: *htp_op = HTP_OP_GATED_DELTA_NET; return 0;

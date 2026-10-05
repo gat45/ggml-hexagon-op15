@@ -83,7 +83,6 @@ enum htp_op_code {
     HTP_OP_SCALE,
     HTP_OP_CPY,
     HTP_OP_ARGSORT,
-    HTP_OP_TOP_K,
     HTP_OP_SQR,
     HTP_OP_SQRT,
     HTP_OP_SUM_ROWS,
@@ -101,6 +100,12 @@ enum htp_op_code {
     HTP_OP_CONCAT,
     HTP_OP_CLAMP,
     HTP_OP_IM2COL,
+
+    // NOTE: appended at the END of the real-op list (2026-10-05): inserting
+    // HTP_OP_TOP_K in the middle shifted every later enum value; the NORM
+    // family returned garbage on device with both sides rebuilt consistently.
+    // Keep new ops at the END unless a device A/B proves otherwise.
+    HTP_OP_TOP_K,
 
     HTP_OP_INVALID
 };

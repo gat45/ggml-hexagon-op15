@@ -4485,6 +4485,13 @@ static bool hexagon_validate_argsort(ggml_backend_hexagon_context * ctx, const g
 }
 
 static bool hexagon_validate_top_k(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+    // [2026-10-05] TOP_K disabled on the AP too: op_top_k k=1 DMA scan path
+    // SIGSEGVs the AP (test-backend-ops RC=139, rig_fix_topk) — port 6ea37e0fe
+    // not ready. Rejecting here makes ggml fall back to the CPU backend.
+    // Re-enable (and delete this early return) once the argmax scan +
+    // merge_runs bugs are fixed and rig-validated.
+    (void) ctx; (void) op;
+    return false;
     // [kan-port] TOP_K shares the chunked sort kernel; validator mirrors argsort
     // with is_top_k=true (kan fastrpc hexagon_validate_top_k).
     const ggml_tensor * src0 = op->src[0]; // values
