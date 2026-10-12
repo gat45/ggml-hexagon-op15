@@ -43,7 +43,10 @@ if(CMAKE_CROSSCOMPILING)
     endif()
     message(STATUS "UI: building llama-ui-embed with host compiler ${HOST_CXX_COMPILER}")
 
-    if(CMAKE_HOST_WIN32)
+    if(DEFINED LLAMA_UI_EMBED AND NOT LLAMA_UI_EMBED STREQUAL "")
+        # override local : build Windows sans compilateur hôte natif
+        set(LLAMA_UI_EMBED_EXE "${LLAMA_UI_EMBED}")
+    elseif(CMAKE_HOST_WIN32)
         set(LLAMA_UI_EMBED_EXE "${CMAKE_CURRENT_BINARY_DIR}/llama-ui-embed-host.exe")
     else()
         set(LLAMA_UI_EMBED_EXE "${CMAKE_CURRENT_BINARY_DIR}/llama-ui-embed-host")
@@ -103,6 +106,7 @@ add_custom_target(llama-ui-assets ALL
         "-DBUILD_UI=${LLAMA_BUILD_UI}"
         "-DLLAMA_UI_EMBED=${LLAMA_UI_EMBED_EXE}"
         "-DLLAMA_UI_GZIP=${LLAMA_UI_GZIP}"
+        "-DLLAMA_UI_STATIC_CPP=${LLAMA_UI_STATIC_CPP}"
         -P "${PROJECT_SOURCE_DIR}/scripts/ui-assets.cmake"
     COMMENT "Provisioning UI assets"
     VERBATIM

@@ -10,6 +10,14 @@
 #include <cerrno>
 #include <algorithm>
 
+// NOTE (2026-09-03) : un ancien bloc de "portabilité" définissait ici
+// posix_madvise/POSIX_MADV_* comme macros vers madvise/MADV_* avant
+// l'include de <sys/mman.h>. C'est FAUX sur NDK moderne (bionic déclare
+// nativement int posix_madvise() depuis API 23) : la macro réécrivait la
+// déclaration du header en `madvise((...))` → "redefinition of 'madvise'".
+// Le bloc a été supprimé : les appels plus bas (lignes ~482/488) utilisent
+// posix_madvise/POSIX_MADV_* qui existent nativement sur Android ≥ 23.
+
 #ifdef __has_include
     #if __has_include(<unistd.h>)
         #include <unistd.h>

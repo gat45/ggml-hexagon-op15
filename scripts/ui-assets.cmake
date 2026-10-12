@@ -283,6 +283,15 @@ function(emit_files dist_dir)
         list(APPEND args "${dist_dir}")
     endif()
 
+    if(DEFINED LLAMA_UI_STATIC_CPP AND EXISTS "${LLAMA_UI_STATIC_CPP}")
+        # override local : copie de ui.cpp/ui.h pré-générés (build sans compilateur hôte natif)
+        get_filename_component(_static_h "${LLAMA_UI_STATIC_CPP}" NAME_WE)
+        file(COPY "${LLAMA_UI_STATIC_CPP}" DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
+        file(COPY "${CMAKE_CURRENT_BINARY_DIR}/${_static_h}.h" DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
+        message(STATUS "UI: static ui.cpp/ui.h copied (embed skipped)")
+        return()
+    endif()
+
     execute_process(
         COMMAND "${LLAMA_UI_EMBED}" ${args}
         RESULT_VARIABLE rc
