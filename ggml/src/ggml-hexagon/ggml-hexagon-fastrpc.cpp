@@ -1871,9 +1871,17 @@ static int ggmlhexagon_init_dsp(ggml_backend_hexagon_context * ctx) {
              htp_arch);
 
     // Build the final URI for ggml_htp_open.
-    // session_id > 0: use FASTRPC_GET_URI to obtain the session-specific URI.
-    // session_id == 0 (or FASTRPC_GET_URI failure): concatenate htp_uri + domain uri.
-    if (ctx->session_id > 0) {
+    // TEST9 FIX (2026-09-05): use FASTRPC_GET_URI unconditionally, including
+    // session_id == 0 (HTP0/default device) — mirrors the dspqueue variant
+    // (ggml-hexagon.cpp), which calls FASTRPC_GET_URI regardless of session_id
+    // and never relies on the static domain-table URI in the success path.
+    // Previously this was gated on `ctx->session_id > 0`, so HTP0 (session_id
+    // 0, the only device exercised by our repro) always fell through to the
+    // static my_domain->uri fallback, which does not resolve to this device's
+    // real dynamic domain (1000/nsp1000) — root cause of
+    // "error 0x80000600: failed to open domain 3(HTP)" documented in
+    // BUG_MEMPOOL_DOMAIN_ID_FIXE_20260905.md.
+    {
         struct remote_rpc_get_uri u = {};
         u.session_id      = ctx->session_id;
         u.domain_name     = const_cast<char *>(CDSP_DOMAIN_NAME);
@@ -1895,7 +1903,7 @@ static int ggmlhexagon_init_dsp(ggml_backend_hexagon_context * ctx) {
         snprintf(final_uri, sizeof(final_uri), "%s%s", htp_uri, uri);
     }
 
-    GGMLHEXAGON_LOG_DEBUG("ggmlop domain uri: %s", final_uri);
+    GGMLHEXAGON_LOG_ALWAYS("[TEST9-DIAG] mempool ggml_htp_open: domain_id=%d final_uri=%s", domain_id, final_uri);
     hexagon_error = ggml_htp_open(final_uri, &ctx->ggmlop_handle);
     if (AEE_SUCCESS == hexagon_error) {
         GGMLHEXAGON_LOG_ALWAYS("succeed to open domain %d(%s)", domain_id, ggmlhexagon_get_dsp_name(domain_id));
