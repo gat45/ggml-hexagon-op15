@@ -360,9 +360,42 @@ static inline bool dma_queue_push(dma_queue *q, dma_ptr dptr, size_t dst_stride,
 
 #else // HVX_ARCH >= 75
 
+// [upstream a91eab67 port, 2026-11-07] The 2d (24-bit) descriptor truncates row_size/
+// src_stride/dst_stride above DMA_MAX_SIZE_24B (16 MiB - 1): previously this path called
+// dma_queue_push_single_2d() unconditionally, silently corrupting any transfer whose
+// row_size or stride exceeded the 24-bit field instead of failing loudly. Guard it and
+// fall back to a row-by-row 1D push (DMA_SAFE_CHUNK_SIZE per chunk) above that limit,
+// mirroring the <75 stride-overflow fallback above.
 static inline bool dma_queue_push(dma_queue *q, dma_ptr dptr, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows) {
-    // On v75 and up we always use 2d 24-bit mode
-    return dma_queue_push_single_2d(q, dptr, dst_stride, src_stride, row_size, nrows);
+    if (nrows == 0 || __builtin_expect(
+            (row_size | src_stride | dst_stride) <= DMA_MAX_SIZE_24B, 1)) {
+        return dma_queue_push_single_2d(q, dptr, dst_stride, src_stride, row_size, nrows);
+    }
+
+    // row_size or a stride exceeds the 24-bit descriptor limit — chunk row-by-row,
+    // and chunk each row itself if row_size alone overflows (DMA_SAFE_CHUNK_SIZE-sized
+    // 1D transfers, same safety margin used elsewhere in this file).
+    const uint8_t *src = (const uint8_t *) dptr.src;
+    uint8_t       *dst = (uint8_t *)       dptr.dst;
+    for (size_t r = 0; r < nrows; r++) {
+        dma_addr_t cur_dst  = (dma_addr_t) (dst + r * dst_stride);
+        dma_addr_t cur_src  = (dma_addr_t) (src + r * src_stride);
+        size_t     rem_bytes = row_size;
+        while (rem_bytes > 0) {
+            const size_t cur_bytes = rem_bytes < DMA_SAFE_CHUNK_SIZE ? rem_bytes : DMA_SAFE_CHUNK_SIZE;
+            dma_ptr p = dma_make_ptr((void *) cur_dst, (const void *) cur_src);
+            if (!dma_queue_push_single_1d(q, p, cur_bytes)) {
+                dma_queue_flush(q);
+                if (!dma_queue_push_single_1d(q, p, cur_bytes)) {
+                    return false;
+                }
+            }
+            cur_dst   += cur_bytes;
+            cur_src   += cur_bytes;
+            rem_bytes -= cur_bytes;
+        }
+    }
+    return true;
 }
 
 #endif
